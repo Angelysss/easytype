@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "easytype"
+version = "1.0.0"
+description = "A private, bidirectional text board for phones and Windows"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "flask>=3.0.0",
+    "flask-sock>=0.7.0",
+    "pillow>=10.0.0",
+    "pyautogui>=0.9.54",
+    "pyperclip>=1.8.2",
+    "pystray>=0.19.5",
+    "qrcode[pil]>=8.0",
+]
+
+[project.scripts]
+easytype = "main:main"
+
+[tool.setuptools]
+py-modules = ["easytype_app", "main"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-cov>=6.0.0",
+    "websocket-client>=1.8.0",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]

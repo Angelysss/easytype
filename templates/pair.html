@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#f7f8fb">
+    <title>配对 EasyType</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <main class="shell pair-shell">
+        <section class="panel pair-panel">
+            <div class="app-mark">E</div>
+            <p class="eyebrow">EASYTYPE</p>
+            <h1>连接共享文本板</h1>
+
+            {% if error %}
+            <p class="warning">{{ error }}</p>
+            {% endif %}
+
+            {% if pairing_code %}
+            <p class="lead">为这台设备起个名字，完成首次配对。</p>
+            <form action="{{ url_for('complete_pairing') }}" method="post" class="pair-form">
+                <input type="hidden" name="code" value="{{ pairing_code }}">
+                <label for="deviceName">设备名称</label>
+                <input
+                    id="deviceName"
+                    name="deviceName"
+                    type="text"
+                    maxlength="80"
+                    placeholder="例如：我的手机"
+                    value="我的手机"
+                    required
+                    autofocus
+                >
+                <button class="button primary full-width" type="submit">授权并打开</button>
+            </form>
+            <p class="muted">此配对链接将在 {{ expires_at }} 失效，且只能使用一次。</p>
+            {% else %}
+            <p class="lead">
+                此设备尚未授权。请在电脑共享文本板首页点击“设备管理”，
+                然后用手机扫描新生成的二维码。
+            </p>
+            {% endif %}
+
+            <p class="hint">仅在可信家庭 Wi‑Fi 中使用，请勿传输密码、验证码或其他敏感内容。</p>
+        </section>
+    </main>
+</body>
+</html>

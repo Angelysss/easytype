@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>EasyType</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <main class="shell pair-shell">
+        <section class="panel pair-panel">
+            <div class="app-mark">E</div>
+            <h1>{{ message }}</h1>
+            <a class="button primary full-width" href="/">返回共享文本板</a>
+        </section>
+    </main>
+</body>
+</html>
