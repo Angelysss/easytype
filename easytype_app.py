@@ -8,6 +8,7 @@ import logging
 import os
 import secrets
 import socket
+import sqlite3
 import sys
 import threading
 import time
@@ -33,11 +34,15 @@ from flask import (
 from flask_sock import Sock
 
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"
 COOKIE_NAME = "easytype_session"
 COOKIE_MAX_AGE_SECONDS = 180 * 24 * 60 * 60
 MAX_TEXT_BYTES = 1024 * 1024
+MAX_BOARDS = 8
 MAX_SOCKET_MESSAGE_BYTES = MAX_TEXT_BYTES + 64 * 1024
+MAX_DIRECT_TEXT_BYTES = 64 * 1024
+MAX_DIRECT_DELETE_COUNT = 4096
+DIRECT_SESSION_IDLE_SECONDS = 3 * 60
 PAIRING_CODE_TTL_SECONDS = 5 * 60
 ACCESS_MODE_PAIRING = "pairing"
 ACCESS_MODE_TRUSTED_LAN = "trusted_lan"
@@ -80,39 +85,102 @@ class InvalidDocument(Exception):
     pass
 
 
-class DocumentStore:
-    def __init__(self, path: Path):
-        self.path = path
-        self._lock = threading.RLock()
-        self._state: dict[str, Any] = {
-            "text": "",
-            "revision": 0,
-            "updatedAt": utc_now(),
-        }
-        self._load()
+class BoardNotFound(Exception):
+    pass
 
-    def _load(self) -> None:
-        if not self.path.exists():
-            return
+
+class BoardLimitReached(Exception):
+    pass
+
+
+class LastBoardDeletion(Exception):
+    pass
+
+
+class InvalidBoardName(Exception):
+    pass
+
+
+class BoardStore:
+    def __init__(self, path: Path, *, legacy_path: Path | None = None):
+        self.path = path
+        self.legacy_path = legacy_path
+        self._lock = threading.RLock()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._initialize()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=5)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def _initialize(self) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS boards (
+                    id TEXT PRIMARY KEY,
+                    number INTEGER NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            count = connection.execute("SELECT COUNT(*) FROM boards").fetchone()[0]
+            if count:
+                return
+
+            legacy = self._load_legacy_document()
+            now = utc_now()
+            for number in range(1, 4):
+                text = legacy["text"] if number == 1 else ""
+                revision = legacy["revision"] if number == 1 else 0
+                updated_at = legacy["updatedAt"] if number == 1 else now
+                connection.execute(
+                    """
+                    INSERT INTO boards (id, number, name, text, revision, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"board-{number}",
+                        number,
+                        f"板 {number}",
+                        text,
+                        revision,
+                        updated_at,
+                    ),
+                )
+
+    def _load_legacy_document(self) -> dict[str, Any]:
+        empty = {"text": "", "revision": 0, "updatedAt": utc_now()}
+        if self.legacy_path is None or not self.legacy_path.exists():
+            return empty
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            payload = json.loads(self.legacy_path.read_text(encoding="utf-8"))
             text = payload["text"]
             revision = payload["revision"]
             updated_at = payload["updatedAt"]
-            if not isinstance(text, str) or not isinstance(revision, int):
-                raise ValueError("invalid document fields")
-            if not isinstance(updated_at, str):
-                raise ValueError("invalid document timestamp")
             self._validate_text(text)
-            self._state = {
+            if (
+                not isinstance(revision, int)
+                or isinstance(revision, bool)
+                or not isinstance(updated_at, str)
+            ):
+                raise ValueError("invalid legacy document")
+            return {
                 "text": text,
                 "revision": max(0, revision),
                 "updatedAt": updated_at,
             }
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
             logging.getLogger(__name__).warning(
-                "Saved document could not be loaded; starting with an empty document."
+                "Saved document could not be migrated; creating empty boards."
             )
+            return empty
 
     @staticmethod
     def _validate_text(text: Any) -> None:
@@ -121,34 +189,202 @@ class DocumentStore:
         if len(text.encode("utf-8")) > MAX_TEXT_BYTES:
             raise InvalidDocument("Text exceeds the 1 MiB limit.")
 
-    def snapshot(self) -> dict[str, Any]:
-        with self._lock:
-            return dict(self._state)
+    @staticmethod
+    def _board_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "number": row["number"],
+            "name": row["name"],
+            "text": row["text"],
+            "revision": row["revision"],
+            "updatedAt": row["updated_at"],
+        }
 
-    def update(self, base_revision: Any, text: Any) -> dict[str, Any]:
+    @staticmethod
+    def _metadata_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "number": row["number"],
+            "name": row["name"],
+            "revision": row["revision"],
+            "updatedAt": row["updated_at"],
+        }
+
+    def list_boards(self) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, number, name, revision, updated_at
+                FROM boards
+                ORDER BY number
+                """
+            ).fetchall()
+            return [self._metadata_from_row(row) for row in rows]
+
+    def first_board_id(self) -> str:
+        boards = self.list_boards()
+        if not boards:
+            raise BoardNotFound("No boards are available.")
+        return boards[0]["id"]
+
+    def snapshot(self, board_id: Any = None) -> dict[str, Any]:
+        if board_id is None:
+            board_id = self.first_board_id()
+        if not isinstance(board_id, str):
+            raise BoardNotFound("Board does not exist.")
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, number, name, text, revision, updated_at
+                FROM boards
+                WHERE id = ?
+                """,
+                (board_id,),
+            ).fetchone()
+            if row is None:
+                raise BoardNotFound("Board does not exist.")
+            return self._board_from_row(row)
+
+    def create_board(self) -> dict[str, Any]:
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing_numbers = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT number FROM boards ORDER BY number"
+                ).fetchall()
+            }
+            if len(existing_numbers) >= MAX_BOARDS:
+                raise BoardLimitReached("At most eight boards are allowed.")
+            next_number = next(
+                number
+                for number in range(1, MAX_BOARDS + 1)
+                if number not in existing_numbers
+            )
+            board_id = f"board-{next_number}-{uuid.uuid4().hex}"
+            updated_at = utc_now()
+            connection.execute(
+                """
+                INSERT INTO boards (id, number, name, text, revision, updated_at)
+                VALUES (?, ?, ?, '', 0, ?)
+                """,
+                (board_id, next_number, f"板 {next_number}", updated_at),
+            )
+            return {
+                "id": board_id,
+                "number": next_number,
+                "name": f"板 {next_number}",
+                "text": "",
+                "revision": 0,
+                "updatedAt": updated_at,
+            }
+
+    def rename_board(self, board_id: Any, name: Any) -> dict[str, Any]:
+        if not isinstance(board_id, str):
+            raise BoardNotFound("Board does not exist.")
+        if not isinstance(name, str):
+            raise InvalidBoardName("Board name must be a string.")
+        normalized_name = " ".join(name.split())
+        if not normalized_name:
+            raise InvalidBoardName("Board name cannot be empty.")
+        if len(normalized_name) > 24:
+            raise InvalidBoardName("Board name is too long.")
+
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT id, number, name, revision, updated_at
+                FROM boards
+                WHERE id = ?
+                """,
+                (board_id,),
+            ).fetchone()
+            if row is None:
+                raise BoardNotFound("Board does not exist.")
+            if row["name"] != normalized_name:
+                connection.execute(
+                    "UPDATE boards SET name = ? WHERE id = ?",
+                    (normalized_name, board_id),
+                )
+            renamed = dict(row)
+            renamed["name"] = normalized_name
+            return renamed
+
+    def delete_board(self, board_id: Any) -> dict[str, Any]:
+        if not isinstance(board_id, str):
+            raise BoardNotFound("Board does not exist.")
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT id, number, name, text, revision, updated_at
+                FROM boards
+                ORDER BY number
+                """
+            ).fetchall()
+            if len(rows) <= 1:
+                raise LastBoardDeletion("At least one board must remain.")
+            deleted_index = next(
+                (index for index, row in enumerate(rows) if row["id"] == board_id),
+                None,
+            )
+            if deleted_index is None:
+                raise BoardNotFound("Board does not exist.")
+            connection.execute("DELETE FROM boards WHERE id = ?", (board_id,))
+            remaining = rows[:deleted_index] + rows[deleted_index + 1 :]
+            fallback_index = min(deleted_index, len(remaining) - 1)
+            return {
+                "deletedId": board_id,
+                "fallback": self._board_from_row(remaining[fallback_index]),
+            }
+
+    def update(
+        self,
+        board_id: Any,
+        base_revision: Any,
+        text: Any,
+    ) -> dict[str, Any]:
         self._validate_text(text)
+        if not isinstance(board_id, str):
+            raise BoardNotFound("Board does not exist.")
         if not isinstance(base_revision, int) or isinstance(base_revision, bool):
             raise InvalidDocument("baseRevision must be an integer.")
 
-        with self._lock:
-            if base_revision != self._state["revision"]:
-                raise RevisionConflict(dict(self._state))
-            if text == self._state["text"]:
-                return dict(self._state)
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT id, number, name, text, revision, updated_at
+                FROM boards
+                WHERE id = ?
+                """,
+                (board_id,),
+            ).fetchone()
+            if row is None:
+                raise BoardNotFound("Board does not exist.")
+            current = self._board_from_row(row)
+            if base_revision != current["revision"]:
+                raise RevisionConflict(current)
+            if text == current["text"]:
+                return current
 
-            self._state = {
-                "text": text,
-                "revision": self._state["revision"] + 1,
-                "updatedAt": utc_now(),
-            }
-            _write_json_atomic(
-                self.path,
-                {
-                    "version": 1,
-                    **self._state,
-                },
+            revision = current["revision"] + 1
+            updated_at = utc_now()
+            connection.execute(
+                """
+                UPDATE boards
+                SET text = ?, revision = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (text, revision, updated_at, board_id),
             )
-            return dict(self._state)
+            return {
+                **current,
+                "text": text,
+                "revision": revision,
+                "updatedAt": updated_at,
+            }
 
 
 class AccessSettingsStore:
@@ -186,7 +422,7 @@ class AccessSettingsStore:
             _write_json_atomic(
                 self.path,
                 {
-                    "version": 1,
+                    "version": 3,
                     "accessMode": self._mode,
                 },
             )
@@ -380,6 +616,189 @@ class WindowsActions:
     def __init__(self) -> None:
         self._lock = threading.Lock()
 
+    @staticmethod
+    def _foreground_window() -> int:
+        if os.name != "nt":
+            raise RuntimeError("Direct input is only available on Windows.")
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        user32.GetForegroundWindow.argtypes = []
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        target = user32.GetForegroundWindow()
+        if target:
+            return int(target)
+
+        class GuiThreadInfo(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("hwndActive", wintypes.HWND),
+                ("hwndFocus", wintypes.HWND),
+                ("hwndCapture", wintypes.HWND),
+                ("hwndMenuOwner", wintypes.HWND),
+                ("hwndMoveSize", wintypes.HWND),
+                ("hwndCaret", wintypes.HWND),
+                ("rcCaret", wintypes.RECT),
+            ]
+
+        user32.GetGUIThreadInfo.argtypes = (
+            wintypes.DWORD,
+            ctypes.POINTER(GuiThreadInfo),
+        )
+        user32.GetGUIThreadInfo.restype = wintypes.BOOL
+        thread_info = GuiThreadInfo()
+        thread_info.cbSize = ctypes.sizeof(GuiThreadInfo)
+        if user32.GetGUIThreadInfo(0, ctypes.byref(thread_info)):
+            target = thread_info.hwndFocus or thread_info.hwndActive
+            if target:
+                return int(target)
+        raise RuntimeError("No foreground window is available.")
+
+    @classmethod
+    def _focused_window(cls) -> int:
+        """Return the focused child control when Windows exposes one."""
+        import ctypes
+        from ctypes import wintypes
+
+        foreground = cls._foreground_window()
+        try:
+            user32 = ctypes.windll.user32
+
+            class GuiThreadInfo(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD),
+                    ("flags", wintypes.DWORD),
+                    ("hwndActive", wintypes.HWND),
+                    ("hwndFocus", wintypes.HWND),
+                    ("hwndCapture", wintypes.HWND),
+                    ("hwndMenuOwner", wintypes.HWND),
+                    ("hwndMoveSize", wintypes.HWND),
+                    ("hwndCaret", wintypes.HWND),
+                    ("rcCaret", wintypes.RECT),
+                ]
+
+            user32.GetWindowThreadProcessId.argtypes = (
+                wintypes.HWND,
+                ctypes.POINTER(wintypes.DWORD),
+            )
+            user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+            thread_id = user32.GetWindowThreadProcessId(foreground, None)
+            user32.GetGUIThreadInfo.argtypes = (
+                wintypes.DWORD,
+                ctypes.POINTER(GuiThreadInfo),
+            )
+            user32.GetGUIThreadInfo.restype = wintypes.BOOL
+            thread_info = GuiThreadInfo()
+            thread_info.cbSize = ctypes.sizeof(GuiThreadInfo)
+            if thread_id and user32.GetGUIThreadInfo(
+                thread_id,
+                ctypes.byref(thread_info),
+            ):
+                focused = thread_info.hwndFocus or thread_info.hwndCaret
+                if focused:
+                    return int(focused)
+        except (AttributeError, OSError, TypeError):
+            pass
+        return foreground
+
+    @staticmethod
+    def _standard_text_control(target: int) -> int:
+        """Find a standard Edit/RichEdit control for fast text insertion."""
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+
+        def class_name(window: int) -> str:
+            buffer = ctypes.create_unicode_buffer(256)
+            try:
+                user32.GetClassNameW.argtypes = (
+                    wintypes.HWND,
+                    wintypes.LPWSTR,
+                    ctypes.c_int,
+                )
+                user32.GetClassNameW.restype = ctypes.c_int
+                if user32.GetClassNameW(window, buffer, len(buffer)):
+                    return buffer.value
+            except (AttributeError, OSError, TypeError):
+                return ""
+            return ""
+
+        def supported(window: int) -> bool:
+            value = class_name(window).casefold()
+            return value == "edit" or value.startswith("richedit")
+
+        if target and supported(target):
+            return int(target)
+
+        try:
+            user32.GetAncestor.argtypes = (wintypes.HWND, wintypes.UINT)
+            user32.GetAncestor.restype = wintypes.HWND
+            root = user32.GetAncestor(target, 2) or target
+            matches: list[int] = []
+            enum_child_proc = ctypes.WINFUNCTYPE(
+                wintypes.BOOL,
+                wintypes.HWND,
+                wintypes.LPARAM,
+            )
+
+            @enum_child_proc
+            def collect(window: int, _parameter: int) -> bool:
+                if supported(window):
+                    matches.append(int(window))
+                return True
+
+            user32.EnumChildWindows.argtypes = (
+                wintypes.HWND,
+                enum_child_proc,
+                wintypes.LPARAM,
+            )
+            user32.EnumChildWindows.restype = wintypes.BOOL
+            user32.EnumChildWindows(root, collect, 0)
+            return matches[0] if matches else 0
+        except (AttributeError, OSError, TypeError):
+            return 0
+
+    @staticmethod
+    def _replace_standard_text(control: int, text: str) -> bool:
+        """Insert text synchronously without flooding the target input queue."""
+        if not control or not text:
+            return False
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        em_replace_sel = 0x00C2
+        smto_block = 0x0001
+        smto_abort_if_hung = 0x0002
+        buffer = ctypes.create_unicode_buffer(text)
+        result = wintypes.WPARAM()
+        try:
+            user32.SendMessageTimeoutW.argtypes = (
+                wintypes.HWND,
+                wintypes.UINT,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+                wintypes.UINT,
+                wintypes.UINT,
+                ctypes.POINTER(wintypes.WPARAM),
+            )
+            user32.SendMessageTimeoutW.restype = wintypes.LPARAM
+            completed = user32.SendMessageTimeoutW(
+                control,
+                em_replace_sel,
+                1,
+                ctypes.cast(buffer, ctypes.c_void_p).value,
+                smto_block | smto_abort_if_hung,
+                150,
+                ctypes.byref(result),
+            )
+            return bool(completed)
+        except (AttributeError, OSError, TypeError):
+            return False
+
     def paste(self, text: str) -> None:
         import pyautogui
         import pyperclip
@@ -389,29 +808,417 @@ class WindowsActions:
             time.sleep(0.08)
             pyautogui.hotkey("ctrl", "v")
 
+    def capture_target(self) -> int:
+        try:
+            return self._focused_window()
+        except RuntimeError:
+            # SendInput itself targets the current Windows foreground control.
+            # Some desktop isolation layers do not expose the foreground HWND,
+            # so keep direct input usable while retaining strict focus checks
+            # whenever Windows provides a handle.
+            return 0
+
+    def direct_input(self, target: int, delete_count: int, text: str) -> None:
+        if os.name != "nt":
+            raise RuntimeError("Direct input is only available on Windows.")
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        try:
+            current_target = self._focused_window()
+        except RuntimeError:
+            current_target = 0
+        if target and current_target and current_target != int(target):
+            raise DirectInputFailure(
+                "focus_changed",
+                "电脑当前窗口已变化，直输已暂停。",
+            )
+
+        if (
+            delete_count == 0
+            and text
+            and self._replace_standard_text(
+                self._standard_text_control(current_target),
+                text,
+            )
+        ):
+            return
+
+        keyeventf_keyup = 0x0002
+        keyeventf_unicode = 0x0004
+        input_keyboard = 1
+        vk_back = 0x08
+        ulong_ptr = wintypes.WPARAM
+
+        class KeyboardInput(ctypes.Structure):
+            _fields_ = [
+                ("wVk", wintypes.WORD),
+                ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ulong_ptr),
+            ]
+
+        class MouseInput(ctypes.Structure):
+            _fields_ = [
+                ("dx", wintypes.LONG),
+                ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ulong_ptr),
+            ]
+
+        class HardwareInput(ctypes.Structure):
+            _fields_ = [
+                ("uMsg", wintypes.DWORD),
+                ("wParamL", wintypes.WORD),
+                ("wParamH", wintypes.WORD),
+            ]
+
+        class InputUnion(ctypes.Union):
+            _fields_ = [
+                ("mi", MouseInput),
+                ("ki", KeyboardInput),
+                ("hi", HardwareInput),
+            ]
+
+        class Input(ctypes.Structure):
+            _anonymous_ = ("value",)
+            _fields_ = [
+                ("type", wintypes.DWORD),
+                ("value", InputUnion),
+            ]
+
+        inputs: list[Input] = []
+
+        def append_key(
+            virtual_key: int,
+            scan_code: int,
+            flags: int,
+        ) -> None:
+            inputs.append(
+                Input(
+                    type=input_keyboard,
+                    value=InputUnion(
+                        ki=KeyboardInput(
+                            wVk=virtual_key,
+                            wScan=scan_code,
+                            dwFlags=flags,
+                            time=0,
+                            dwExtraInfo=0,
+                        )
+                    ),
+                )
+            )
+
+        for _ in range(delete_count):
+            append_key(vk_back, 0, 0)
+            append_key(vk_back, 0, keyeventf_keyup)
+
+        encoded = text.encode("utf-16-le")
+        for index in range(0, len(encoded), 2):
+            scan_code = int.from_bytes(encoded[index : index + 2], "little")
+            append_key(0, scan_code, keyeventf_unicode)
+            append_key(0, scan_code, keyeventf_unicode | keyeventf_keyup)
+
+        if not inputs:
+            return
+        input_array = (Input * len(inputs))(*inputs)
+        user32.SendInput.argtypes = (
+            wintypes.UINT,
+            ctypes.POINTER(Input),
+            ctypes.c_int,
+        )
+        user32.SendInput.restype = wintypes.UINT
+        sent = user32.SendInput(
+            len(input_array),
+            input_array,
+            ctypes.sizeof(Input),
+        )
+        if sent != len(input_array):
+            raise RuntimeError("Windows did not accept all simulated input events.")
+
+    def direct_key(self, target: int, key: str) -> None:
+        if os.name != "nt":
+            raise RuntimeError("Direct input is only available on Windows.")
+        import ctypes
+        from ctypes import wintypes
+
+        virtual_keys = {
+            "backspace": 0x08,
+            "enter": 0x0D,
+        }
+        virtual_key = virtual_keys.get(key)
+        if virtual_key is None:
+            raise ValueError("Unsupported direct key.")
+
+        try:
+            current_target = self._focused_window()
+        except RuntimeError:
+            current_target = 0
+        if target and current_target and current_target != int(target):
+            raise DirectInputFailure(
+                "focus_changed",
+                "电脑当前窗口已变化，直输已暂停。",
+            )
+
+        user32 = ctypes.windll.user32
+        user32.keybd_event.argtypes = (
+            ctypes.c_ubyte,
+            ctypes.c_ubyte,
+            wintypes.DWORD,
+            wintypes.WPARAM,
+        )
+        user32.keybd_event.restype = None
+        keyeventf_keyup = 0x0002
+        user32.keybd_event(virtual_key, 0, 0, 0)
+        user32.keybd_event(virtual_key, 0, keyeventf_keyup, 0)
+
+
+class DirectInputFailure(Exception):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class DirectInputManager:
+    def __init__(self, actions: Any):
+        self.actions = actions
+        self._lock = threading.RLock()
+        self._session: dict[str, Any] | None = None
+
+    def _purge_expired(self) -> None:
+        if (
+            self._session is not None
+            and time.monotonic() - self._session["lastActivity"]
+            > DIRECT_SESSION_IDLE_SECONDS
+        ):
+            self._session = None
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            self._purge_expired()
+            if self._session is None:
+                return {"active": False}
+            return {
+                "active": True,
+                "deviceName": self._session["deviceName"],
+                "startedAt": self._session["startedAt"],
+            }
+
+    def begin(
+        self,
+        *,
+        connection_id: str,
+        device_id: str,
+        device_name: str,
+    ) -> dict[str, Any]:
+        with self._lock:
+            self._purge_expired()
+            if self._session is not None:
+                if self._session["connectionId"] == connection_id:
+                    return dict(self._session)
+                raise DirectInputFailure(
+                    "direct_busy",
+                    f'{self._session["deviceName"]} 正在使用直输。',
+                )
+            try:
+                target = self.actions.capture_target()
+            except DirectInputFailure:
+                raise
+            except Exception as error:
+                raise DirectInputFailure(
+                    "target_unavailable",
+                    "无法获取电脑当前窗口。",
+                ) from error
+            self._session = {
+                "id": str(uuid.uuid4()),
+                "connectionId": connection_id,
+                "deviceId": device_id,
+                "deviceName": device_name,
+                "target": target,
+                "lastSequence": 0,
+                "lastActivity": time.monotonic(),
+                "startedAt": utc_now(),
+            }
+            return dict(self._session)
+
+    def apply(
+        self,
+        *,
+        connection_id: str,
+        session_id: Any,
+        sequence: Any,
+        delete_count: Any,
+        text: Any,
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(sequence, int)
+            or isinstance(sequence, bool)
+            or sequence < 1
+        ):
+            raise DirectInputFailure("invalid_sequence", "直输序号无效。")
+        if (
+            not isinstance(delete_count, int)
+            or isinstance(delete_count, bool)
+            or not 0 <= delete_count <= MAX_DIRECT_DELETE_COUNT
+        ):
+            raise DirectInputFailure("invalid_delete", "直输删除长度无效。")
+        if not isinstance(text, str):
+            raise DirectInputFailure("invalid_text", "直输内容无效。")
+        if len(text.encode("utf-8")) > MAX_DIRECT_TEXT_BYTES:
+            raise DirectInputFailure("direct_text_too_large", "单次直输内容过长。")
+
+        with self._lock:
+            self._purge_expired()
+            session = self._session
+            if (
+                session is None
+                or session["id"] != session_id
+                or session["connectionId"] != connection_id
+            ):
+                raise DirectInputFailure("direct_inactive", "直输会话已结束。")
+            if sequence <= session["lastSequence"]:
+                return {
+                    "sessionId": session["id"],
+                    "sequence": sequence,
+                    "duplicate": True,
+                }
+            if sequence != session["lastSequence"] + 1:
+                raise DirectInputFailure("sequence_gap", "直输消息顺序不连续。")
+            try:
+                self.actions.direct_input(
+                    session["target"],
+                    delete_count,
+                    text,
+                )
+            except DirectInputFailure:
+                self._session = None
+                raise
+            except Exception as error:
+                self._session = None
+                raise DirectInputFailure(
+                    "direct_input_failed",
+                    "电脑模拟输入失败。",
+                ) from error
+            session["lastSequence"] = sequence
+            session["lastActivity"] = time.monotonic()
+            return {
+                "sessionId": session["id"],
+                "sequence": sequence,
+                "duplicate": False,
+            }
+
+    def apply_key(
+        self,
+        *,
+        connection_id: str,
+        session_id: Any,
+        request_id: Any,
+        key: Any,
+    ) -> dict[str, Any]:
+        if key not in {"backspace", "enter"}:
+            raise DirectInputFailure("invalid_direct_key", "直输按键无效。")
+        if not isinstance(request_id, str) or not 1 <= len(request_id) <= 100:
+            raise DirectInputFailure("invalid_request_id", "直输请求标识无效。")
+
+        with self._lock:
+            self._purge_expired()
+            session = self._session
+            if (
+                session is None
+                or session["id"] != session_id
+                or session["connectionId"] != connection_id
+            ):
+                raise DirectInputFailure("direct_inactive", "直输会话已结束。")
+            try:
+                self.actions.direct_key(session["target"], key)
+            except DirectInputFailure:
+                self._session = None
+                raise
+            except Exception as error:
+                self._session = None
+                raise DirectInputFailure(
+                    "direct_key_failed",
+                    "电脑模拟按键失败。",
+                ) from error
+            session["lastActivity"] = time.monotonic()
+            return {
+                "sessionId": session["id"],
+                "requestId": request_id,
+                "key": key,
+            }
+
+    def stop(
+        self,
+        *,
+        connection_id: str | None = None,
+        session_id: Any = None,
+        force: bool = False,
+    ) -> bool:
+        with self._lock:
+            if self._session is None:
+                return False
+            if not force:
+                if self._session["connectionId"] != connection_id:
+                    return False
+                if session_id is not None and self._session["id"] != session_id:
+                    return False
+            self._session = None
+            return True
+
 
 class SyncHub:
     def __init__(self):
         self._lock = threading.RLock()
-        self._connections: dict[str, tuple[Any, str]] = {}
+        self._connections: dict[str, dict[str, Any]] = {}
 
-    def register(self, websocket: Any, device_id: str) -> str:
+    def register(self, websocket: Any, device_id: str, board_id: str) -> str:
         connection_id = str(uuid.uuid4())
         with self._lock:
-            self._connections[connection_id] = (websocket, device_id)
+            self._connections[connection_id] = {
+                "websocket": websocket,
+                "deviceId": device_id,
+                "boardId": board_id,
+            }
         return connection_id
 
     def unregister(self, connection_id: str) -> None:
         with self._lock:
             self._connections.pop(connection_id, None)
 
-    def broadcast(self, message: dict[str, Any], *, exclude: str | None = None) -> None:
+    def select_board(self, connection_id: str, board_id: str) -> None:
+        with self._lock:
+            connection = self._connections.get(connection_id)
+            if connection is not None:
+                connection["boardId"] = board_id
+
+    def replace_board(self, deleted_board_id: str, fallback_board_id: str) -> None:
+        with self._lock:
+            for connection in self._connections.values():
+                if connection["boardId"] == deleted_board_id:
+                    connection["boardId"] = fallback_board_id
+
+    def broadcast(
+        self,
+        message: dict[str, Any],
+        *,
+        exclude: str | None = None,
+        board_id: str | None = None,
+    ) -> None:
         encoded = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
         with self._lock:
             recipients = [
-                (connection_id, websocket)
-                for connection_id, (websocket, _device_id) in self._connections.items()
+                (connection_id, connection["websocket"])
+                for connection_id, connection in self._connections.items()
                 if connection_id != exclude
+                and (
+                    board_id is None
+                    or connection["boardId"] == board_id
+                )
             ]
         stale: list[str] = []
         for connection_id, websocket in recipients:
@@ -425,9 +1232,9 @@ class SyncHub:
     def revoke_device(self, device_id: str) -> None:
         with self._lock:
             matches = [
-                (connection_id, websocket)
-                for connection_id, (websocket, current_device_id) in self._connections.items()
-                if current_device_id == device_id
+                (connection_id, connection["websocket"])
+                for connection_id, connection in self._connections.items()
+                if connection["deviceId"] == device_id
             ]
         for connection_id, websocket in matches:
             try:
@@ -439,9 +1246,12 @@ class SyncHub:
     def close_all(self) -> None:
         with self._lock:
             connections = list(self._connections.items())
-        for connection_id, (websocket, _device_id) in connections:
+        for connection_id, connection in connections:
             try:
-                websocket.close(reason=1001, message="EasyType is shutting down.")
+                connection["websocket"].close(
+                    reason=1001,
+                    message="EasyType is shutting down.",
+                )
             except Exception:
                 pass
             self.unregister(connection_id)
@@ -566,19 +1376,24 @@ def create_app(
     app.json.ensure_ascii = False
 
     resolved_data_dir = Path(data_dir) if data_dir is not None else default_data_dir()
-    document_store = DocumentStore(resolved_data_dir / "state.json")
+    board_store = BoardStore(
+        resolved_data_dir / "state.db",
+        legacy_path=resolved_data_dir / "state.json",
+    )
     access_settings = AccessSettingsStore(resolved_data_dir / "settings.json")
     auth_store = AuthStore(resolved_data_dir / "auth.json")
     pairing_manager = PairingManager()
     sync_hub = SyncHub()
     actions = action_backend or WindowsActions()
+    direct_input = DirectInputManager(actions)
 
-    app.extensions["easytype_document"] = document_store
+    app.extensions["easytype_boards"] = board_store
     app.extensions["easytype_access_settings"] = access_settings
     app.extensions["easytype_auth"] = auth_store
     app.extensions["easytype_pairing"] = pairing_manager
     app.extensions["easytype_hub"] = sync_hub
     app.extensions["easytype_actions"] = actions
+    app.extensions["easytype_direct_input"] = direct_input
 
     sock = Sock(app)
 
@@ -693,6 +1508,7 @@ def create_app(
         return render_template(
             "index.html",
             max_text_bytes=MAX_TEXT_BYTES,
+            max_boards=MAX_BOARDS,
             is_local=is_local,
             access_mode=access_settings.mode(),
             lan_url=lan_url,
@@ -745,7 +1561,7 @@ def create_app(
     @app.get("/api/info")
     @require_auth
     def api_info() -> Any:
-        snapshot = document_store.snapshot()
+        snapshot = board_store.snapshot()
         return jsonify(
             {
                 "ok": True,
@@ -754,13 +1570,89 @@ def create_app(
                 "revision": snapshot["revision"],
                 "updatedAt": snapshot["updatedAt"],
                 "accessMode": access_settings.mode(),
+                "boardCount": len(board_store.list_boards()),
+                "maxBoards": MAX_BOARDS,
             }
         )
 
     @app.get("/api/document")
     @require_auth
     def api_document() -> Any:
-        return jsonify({"ok": True, "document": document_store.snapshot()})
+        try:
+            document = board_store.snapshot(request.args.get("boardId"))
+        except BoardNotFound:
+            return jsonify_error("board_not_found", "共享板不存在。", 404)
+        return jsonify({"ok": True, "document": document})
+
+    @app.get("/api/boards")
+    @require_auth
+    def api_boards() -> Any:
+        return jsonify(
+            {
+                "ok": True,
+                "boards": board_store.list_boards(),
+                "maxBoards": MAX_BOARDS,
+            }
+        )
+
+    @app.post("/api/boards")
+    @require_auth
+    @require_mutation_origin
+    def create_board() -> Any:
+        try:
+            board = board_store.create_board()
+        except BoardLimitReached:
+            return jsonify_error(
+                "board_limit_reached",
+                f"最多只能创建 {MAX_BOARDS} 个共享板。",
+                409,
+            )
+        sync_hub.broadcast({"type": "board_created", "board": board})
+        return jsonify({"ok": True, "board": board}), 201
+
+    @app.patch("/api/boards/<board_id>")
+    @require_auth
+    @require_mutation_origin
+    def rename_board(board_id: str) -> Any:
+        payload = request.get_json(silent=True)
+        name = payload.get("name") if isinstance(payload, dict) else None
+        try:
+            board = board_store.rename_board(board_id, name)
+        except BoardNotFound:
+            return jsonify_error("board_not_found", "共享板不存在。", 404)
+        except InvalidBoardName:
+            return jsonify_error(
+                "invalid_board_name",
+                "名称不能为空，且最多为 24 个字符。",
+                400,
+            )
+        sync_hub.broadcast({"type": "board_renamed", "board": board})
+        return jsonify({"ok": True, "board": board})
+
+    @app.delete("/api/boards/<board_id>")
+    @require_auth
+    @require_mutation_origin
+    def delete_board(board_id: str) -> Any:
+        try:
+            result = board_store.delete_board(board_id)
+        except BoardNotFound:
+            return jsonify_error("board_not_found", "共享板不存在。", 404)
+        except LastBoardDeletion:
+            return jsonify_error(
+                "last_board_required",
+                "至少需要保留一个共享板。",
+                409,
+            )
+        fallback = result["fallback"]
+        sync_hub.replace_board(result["deletedId"], fallback["id"])
+        sync_hub.broadcast(
+            {
+                "type": "board_deleted",
+                "boardId": result["deletedId"],
+                "fallback": fallback,
+            }
+        )
+        return jsonify({"ok": True, **result})
 
     @app.post("/api/actions/paste")
     @require_auth
@@ -773,11 +1665,53 @@ def create_app(
                 403,
             )
         try:
-            actions.paste(document_store.snapshot()["text"])
+            payload = request.get_json(silent=True)
+            board_id = payload.get("boardId") if isinstance(payload, dict) else None
+            actions.paste(board_store.snapshot(board_id)["text"])
             return jsonify({"ok": True})
+        except BoardNotFound:
+            return jsonify_error("board_not_found", "共享板不存在。", 404)
         except Exception:
             app.logger.exception("Paste action failed.")
             return jsonify_error("paste_failed", "插入到电脑当前窗口失败。", 500)
+
+    @app.post("/api/actions/enter")
+    @require_auth
+    @require_mutation_origin
+    def press_enter() -> Any:
+        if _is_loopback_request():
+            return jsonify_error(
+                "remote_only",
+                "回车功能仅在手机端可用。",
+                403,
+            )
+        try:
+            actions.direct_key(0, "enter")
+            return jsonify({"ok": True})
+        except Exception:
+            app.logger.exception("Remote Enter action failed.")
+            return jsonify_error("enter_failed", "发送电脑回车失败。", 500)
+
+    @app.post("/api/actions/key")
+    @require_auth
+    @require_mutation_origin
+    def press_remote_key() -> Any:
+        if _is_loopback_request():
+            return jsonify_error(
+                "remote_only",
+                "电脑按键功能仅在手机端可用。",
+                403,
+            )
+        payload = request.get_json(silent=True)
+        key = payload.get("key") if isinstance(payload, dict) else None
+        if key not in {"backspace", "enter"}:
+            return jsonify_error("invalid_key", "电脑按键无效。", 400)
+        try:
+            actions.direct_key(0, key)
+            return jsonify({"ok": True, "key": key})
+        except Exception:
+            app.logger.exception("Remote key action failed.")
+            return jsonify_error("key_failed", "发送电脑按键失败。", 500)
 
     @app.get("/admin")
     @require_local
@@ -894,13 +1828,20 @@ def create_app(
             websocket.close(reason=1008, message="Pairing required.")
             return
 
-        connection_id = sync_hub.register(websocket, device["id"])
+        first_board_id = board_store.first_board_id()
+        connection_id = sync_hub.register(
+            websocket,
+            device["id"],
+            first_board_id,
+        )
         try:
             websocket.send(
                 json.dumps(
                     {
                         "type": "snapshot",
-                        "document": document_store.snapshot(),
+                        "boards": board_store.list_boards(),
+                        "document": board_store.snapshot(first_board_id),
+                        "direct": direct_input.status(),
                         "deviceId": device["id"],
                     },
                     ensure_ascii=False,
@@ -944,20 +1885,258 @@ def create_app(
                 if message_type == "ping":
                     websocket.send('{"type":"pong"}')
                     continue
+
+                if message_type == "select_board":
+                    try:
+                        document = board_store.snapshot(message.get("boardId"))
+                    except BoardNotFound:
+                        send_socket_error(
+                            websocket,
+                            "board_not_found",
+                            "共享板不存在。",
+                        )
+                        continue
+                    sync_hub.select_board(connection_id, document["id"])
+                    websocket.send(
+                        json.dumps(
+                            {
+                                "type": "board_snapshot",
+                                "document": document,
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    )
+                    continue
+
+                if message_type == "create_board":
+                    try:
+                        board = board_store.create_board()
+                    except BoardLimitReached:
+                        send_socket_error(
+                            websocket,
+                            "board_limit_reached",
+                            f"最多只能创建 {MAX_BOARDS} 个共享板。",
+                        )
+                        continue
+                    sync_hub.broadcast(
+                        {
+                            "type": "board_created",
+                            "board": board,
+                            "sourceId": str(message.get("clientId") or ""),
+                        }
+                    )
+                    continue
+
+                if message_type == "rename_board":
+                    try:
+                        board = board_store.rename_board(
+                            message.get("boardId"),
+                            message.get("name"),
+                        )
+                    except BoardNotFound:
+                        send_socket_error(
+                            websocket,
+                            "board_not_found",
+                            "共享板不存在。",
+                        )
+                        continue
+                    except InvalidBoardName:
+                        send_socket_error(
+                            websocket,
+                            "invalid_board_name",
+                            "名称不能为空，且最多为 24 个字符。",
+                        )
+                        continue
+                    sync_hub.broadcast(
+                        {
+                            "type": "board_renamed",
+                            "board": board,
+                            "sourceId": str(message.get("clientId") or ""),
+                        }
+                    )
+                    continue
+
+                if message_type == "delete_board":
+                    try:
+                        result = board_store.delete_board(message.get("boardId"))
+                    except BoardNotFound:
+                        send_socket_error(
+                            websocket,
+                            "board_not_found",
+                            "共享板不存在。",
+                        )
+                        continue
+                    except LastBoardDeletion:
+                        send_socket_error(
+                            websocket,
+                            "last_board_required",
+                            "至少需要保留一个共享板。",
+                        )
+                        continue
+                    fallback = result["fallback"]
+                    sync_hub.replace_board(result["deletedId"], fallback["id"])
+                    sync_hub.broadcast(
+                        {
+                            "type": "board_deleted",
+                            "boardId": result["deletedId"],
+                            "fallback": fallback,
+                            "sourceId": str(message.get("clientId") or ""),
+                        }
+                    )
+                    continue
+
+                if message_type == "direct_start":
+                    if device["id"] == "local":
+                        send_socket_error(
+                            websocket,
+                            "remote_only",
+                            "请在手机网页上开启直输。",
+                        )
+                        continue
+                    try:
+                        session = direct_input.begin(
+                            connection_id=connection_id,
+                            device_id=device["id"],
+                            device_name=device["name"],
+                        )
+                    except DirectInputFailure as error:
+                        send_socket_error(websocket, error.code, error.message)
+                        continue
+                    websocket.send(
+                        json.dumps(
+                            {
+                                "type": "direct_started",
+                                "sessionId": session["id"],
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    )
+                    sync_hub.broadcast(
+                        {
+                            "type": "direct_status",
+                            "direct": direct_input.status(),
+                        }
+                    )
+                    continue
+
+                if message_type == "direct_stop":
+                    stopped = direct_input.stop(
+                        connection_id=connection_id,
+                        session_id=message.get("sessionId"),
+                    )
+                    websocket.send(
+                        json.dumps(
+                            {
+                                "type": "direct_stopped",
+                                "stopped": stopped,
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    )
+                    if stopped:
+                        sync_hub.broadcast(
+                            {
+                                "type": "direct_status",
+                                "direct": direct_input.status(),
+                            }
+                        )
+                    continue
+
+                if message_type == "direct_input":
+                    try:
+                        acknowledgement = direct_input.apply(
+                            connection_id=connection_id,
+                            session_id=message.get("sessionId"),
+                            sequence=message.get("sequence"),
+                            delete_count=message.get("deleteCount"),
+                            text=message.get("text"),
+                        )
+                    except DirectInputFailure as error:
+                        send_socket_error(websocket, error.code, error.message)
+                        if error.code in {
+                            "focus_changed",
+                            "direct_input_failed",
+                            "direct_inactive",
+                        }:
+                            sync_hub.broadcast(
+                                {
+                                    "type": "direct_status",
+                                    "direct": direct_input.status(),
+                                }
+                            )
+                        continue
+                    websocket.send(
+                        json.dumps(
+                            {
+                                "type": "direct_ack",
+                                **acknowledgement,
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    )
+                    continue
+
+                if message_type == "direct_key":
+                    try:
+                        acknowledgement = direct_input.apply_key(
+                            connection_id=connection_id,
+                            session_id=message.get("sessionId"),
+                            request_id=message.get("requestId"),
+                            key=message.get("key"),
+                        )
+                    except DirectInputFailure as error:
+                        send_socket_error(websocket, error.code, error.message)
+                        if error.code in {
+                            "focus_changed",
+                            "direct_key_failed",
+                            "direct_inactive",
+                        }:
+                            sync_hub.broadcast(
+                                {
+                                    "type": "direct_status",
+                                    "direct": direct_input.status(),
+                                }
+                            )
+                        continue
+                    websocket.send(
+                        json.dumps(
+                            {
+                                "type": "direct_key_ack",
+                                **acknowledgement,
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    )
+                    continue
+
                 if message_type != "update":
                     send_socket_error(websocket, "unknown_message", "未知消息类型。")
                     continue
 
                 try:
-                    updated = document_store.update(
+                    updated = board_store.update(
+                        message.get("boardId"),
                         message.get("baseRevision"),
                         message.get("text"),
                     )
+                except BoardNotFound:
+                    send_socket_error(
+                        websocket,
+                        "board_not_found",
+                        "共享板不存在。",
+                    )
+                    continue
                 except RevisionConflict as conflict:
                     websocket.send(
                         json.dumps(
                             {
                                 "type": "conflict",
+                                "boardId": conflict.snapshot["id"],
                                 "document": conflict.snapshot,
                             },
                             ensure_ascii=False,
@@ -973,6 +2152,7 @@ def create_app(
                     json.dumps(
                         {
                             "type": "ack",
+                            "boardId": updated["id"],
                             "revision": updated["revision"],
                             "updatedAt": updated["updatedAt"],
                         },
@@ -987,11 +2167,37 @@ def create_app(
                         "sourceId": str(message.get("clientId") or ""),
                     },
                     exclude=connection_id,
+                    board_id=updated["id"],
+                )
+                sync_hub.broadcast(
+                    {
+                        "type": "board_updated",
+                        "board": {
+                            key: updated[key]
+                            for key in (
+                                "id",
+                                "number",
+                                "name",
+                                "revision",
+                                "updatedAt",
+                            )
+                        },
+                        "sourceId": str(message.get("clientId") or ""),
+                    },
+                    exclude=connection_id,
                 )
         except Exception:
             app.logger.debug("WebSocket disconnected.", exc_info=True)
         finally:
+            direct_stopped = direct_input.stop(connection_id=connection_id)
             sync_hub.unregister(connection_id)
+            if direct_stopped:
+                sync_hub.broadcast(
+                    {
+                        "type": "direct_status",
+                        "direct": direct_input.status(),
+                    }
+                )
 
     @app.errorhandler(413)
     def request_too_large(_error: Any) -> Any:

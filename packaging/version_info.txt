@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 1, 0),
-    prodvers=(1, 0, 1, 0),
+    filevers=(1, 1, 0, 0),
+    prodvers=(1, 1, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -17,11 +17,11 @@ VSVersionInfo(
           [
             StringStruct("CompanyName", "Angelysss"),
             StringStruct("FileDescription", "EasyType 双向共享文本板"),
-            StringStruct("FileVersion", "1.0.1"),
+            StringStruct("FileVersion", "1.1.0"),
             StringStruct("InternalName", "EasyType"),
-            StringStruct("OriginalFilename", "EasyType-1.0.1.exe"),
+            StringStruct("OriginalFilename", "EasyType-1.1.0.exe"),
             StringStruct("ProductName", "EasyType"),
-            StringStruct("ProductVersion", "1.0.1")
+            StringStruct("ProductVersion", "1.1.0")
           ]
         )
       ]
