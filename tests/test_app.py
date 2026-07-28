@@ -16,11 +16,7 @@ from easytype_app import (
 
 class FakeActions:
     def __init__(self):
-        self.copied = []
         self.pasted = []
-
-    def copy(self, text):
-        self.copied.append(text)
 
     def paste(self, text):
         self.pasted.append(text)
@@ -73,7 +69,7 @@ def test_local_editor_and_info_are_available(client, monkeypatch):
     assert 'id="aboutButton"' in page_text
     assert 'id="aboutPanel"' in page_text
     assert "https://github.com/Angelysss/easytype" in page_text
-    assert "“插入”的作用" in page_text
+    assert "手机端“插入”的作用" in page_text
     assert re.search(
         r'class="topbar-title-row"[^>]*>.*共享文本板.*id="connectionBadge"',
         page_text,
@@ -83,10 +79,10 @@ def test_local_editor_and_info_are_available(client, monkeypatch):
     assert "可信局域网模式" not in page_text
     assert "信任模式" in page_text
     assert 'id="revisionState"' not in page_text
-    assert "EasyType v1.0.0" in page_text
+    assert "EasyType v1.0.1" in page_text
     assert "http://192.168.1.10:5000" in page_text
     assert re.search(r'id="copyButton"[^>]*>\s*复制\s*</button>', page_text)
-    assert re.search(r'id="pasteButton"[^>]*>\s*插入\s*</button>', page_text)
+    assert 'id="pasteButton"' not in page_text
     assert re.search(r'id="clearButton"[^>]*>\s*清空\s*</button>', page_text)
     assert re.search(
         r'class="editor-meta"[^>]*>.*id="charCount".*>\|<.*id="syncState"',
@@ -96,7 +92,7 @@ def test_local_editor_and_info_are_available(client, monkeypatch):
     assert 'class="action-card"' not in page_text
     assert 'class="editor-action-note"' not in page_text
     assert info.status_code == 200
-    assert info.get_json()["version"] == "1.0.0"
+    assert info.get_json()["version"] == "1.0.1"
     assert info.get_json()["revision"] == 0
     assert page.headers["Content-Security-Policy"].startswith("default-src")
 
@@ -108,11 +104,14 @@ def test_local_editor_and_info_are_available(client, monkeypatch):
 
 def test_static_assets_have_browser_executable_mime_types(client):
     javascript = client.get("/static/admin.js")
+    editor_javascript = client.get("/static/editor.js")
     stylesheet = client.get("/static/styles.css")
 
     assert javascript.status_code == 200
     assert javascript.mimetype == "application/javascript"
     assert javascript.headers["X-Content-Type-Options"] == "nosniff"
+    assert 'document.execCommand("copy")' in editor_javascript.get_data(as_text=True)
+    assert "navigator.clipboard?.writeText" in editor_javascript.get_data(as_text=True)
     assert stylesheet.status_code == 200
     assert stylesheet.mimetype == "text/css"
 
@@ -201,7 +200,9 @@ def test_admin_is_loopback_only(app, client):
     remote_editor = remote_client.get("/", environ_overrides=remote_environ())
 
     assert remote_editor.status_code == 200
-    assert 'href="/admin"' not in remote_editor.get_data(as_text=True)
+    remote_editor_text = remote_editor.get_data(as_text=True)
+    assert 'href="/admin"' not in remote_editor_text
+    assert re.search(r'id="pasteButton"[^>]*>\s*插入\s*</button>', remote_editor_text)
 
 
 def test_local_access_mode_switch_controls_unpaired_lan_access(app, client):
@@ -305,54 +306,42 @@ def test_trusted_lan_mode_shows_one_phone_address_and_qr(client, monkeypatch):
     assert qr.mimetype == "image/png"
 
 
-def test_copy_and_paste_use_only_the_current_document(app, client):
-    app.extensions["easytype_document"].update(0, "只复制服务端文本")
+def test_insert_is_remote_only_and_uses_current_shared_text(app):
+    app.extensions["easytype_document"].update(0, "手机写好的 Prompt")
     actions = app.extensions["test_actions"]
+    _device, token = app.extensions["easytype_auth"].create_device("手机")
+    remote_client = app.test_client()
+    remote_client.set_cookie(COOKIE_NAME, token)
 
-    copied = client.post(
-        "/api/actions/copy",
-        json={"text": "攻击者提供的文本"},
-        headers={"Origin": "http://localhost"},
-    )
-    pasted = client.post(
+    local = app.test_client().post(
         "/api/actions/paste",
         json={},
         headers={"Origin": "http://localhost"},
     )
-
-    assert copied.status_code == 200
-    assert pasted.status_code == 200
-    assert actions.copied == ["只复制服务端文本"]
-    assert actions.pasted == ["只复制服务端文本"]
-
-
-def test_remote_origin_is_required_for_mutating_action(app):
-    auth = app.extensions["easytype_auth"]
-    _device, token = auth.create_device("手机")
-    client = app.test_client()
-    client.set_cookie(COOKIE_NAME, token)
-
-    missing = client.post(
-        "/api/actions/copy",
+    missing_origin = remote_client.post(
+        "/api/actions/paste",
         json={},
         environ_overrides=remote_environ(),
     )
-    wrong = client.post(
-        "/api/actions/copy",
+    wrong_origin = remote_client.post(
+        "/api/actions/paste",
         json={},
         headers={"Origin": "http://wrong.example"},
         environ_overrides=remote_environ(),
     )
-    correct = client.post(
-        "/api/actions/copy",
-        json={},
+    inserted = remote_client.post(
+        "/api/actions/paste",
+        json={"text": "不能由请求覆盖"},
         headers={"Origin": "http://localhost"},
         environ_overrides=remote_environ(),
     )
 
-    assert missing.status_code == 403
-    assert wrong.status_code == 403
-    assert correct.status_code == 200
+    assert local.status_code == 403
+    assert local.get_json()["error"]["code"] == "remote_only"
+    assert missing_origin.status_code == 403
+    assert wrong_origin.status_code == 403
+    assert inserted.status_code == 200
+    assert actions.pasted == ["手机写好的 Prompt"]
 
 
 def test_device_revocation_invalidates_cookie(app):
@@ -406,3 +395,4 @@ def test_pairing_qr_and_device_list_do_not_expose_tokens(app, client, monkeypatc
 def test_legacy_remote_control_routes_are_removed(client):
     assert client.post("/type", json={"text": "unsafe"}).status_code == 404
     assert client.post("/key", json={"key": "enter"}).status_code == 404
+    assert client.post("/api/actions/copy", json={}).status_code == 404

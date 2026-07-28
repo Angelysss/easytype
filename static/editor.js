@@ -57,9 +57,9 @@
     function setConnection(status, label) {
         connectionBadge.className = `status-badge status-${status}`;
         connectionText.textContent = label;
-        const available = status === "online";
-        copyButton.disabled = !available;
-        pasteButton.disabled = !available;
+        if (pasteButton) {
+            pasteButton.disabled = status !== "online";
+        }
     }
 
     function setSync(label) {
@@ -395,8 +395,43 @@
         });
     }
 
-    async function postAction(action) {
-        const response = await fetch(`/api/actions/${action}`, {
+    function copyUsingSelection() {
+        const hadFocus = document.activeElement === input;
+        const selectionStart = input.selectionStart;
+        const selectionEnd = input.selectionEnd;
+        const selectionDirection = input.selectionDirection;
+
+        input.focus({ preventScroll: true });
+        input.select();
+        const copied = document.execCommand("copy");
+        input.setSelectionRange(
+            selectionStart,
+            selectionEnd,
+            selectionDirection,
+        );
+        if (!hadFocus) {
+            input.blur();
+        }
+        return copied;
+    }
+
+    async function copyToCurrentDevice() {
+        if (globalThis.isSecureContext && navigator.clipboard?.writeText) {
+            await navigator.clipboard.writeText(input.value);
+            return;
+        }
+        try {
+            if (copyUsingSelection()) {
+                return;
+            }
+        } catch (_error) {
+            // Show the manual-copy guidance below.
+        }
+        throw new Error("当前浏览器未允许自动复制，请长按文本手动复制。");
+    }
+
+    async function pasteIntoComputer() {
+        const response = await fetch("/api/actions/paste", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: "{}",
@@ -407,7 +442,7 @@
         }
         const payload = await response.json();
         if (!response.ok) {
-            throw new Error(payload.error?.message ?? "操作失败。");
+            throw new Error(payload.error?.message ?? "插入到电脑当前窗口失败。");
         }
     }
 
@@ -518,21 +553,23 @@
 
     copyButton.addEventListener("click", async () => {
         try {
-            await postAction("copy");
-            showToast("已复制到电脑剪贴板。");
+            await copyToCurrentDevice();
+            showToast("已复制到当前设备剪贴板。");
         } catch (error) {
             showToast(error.message, true);
         }
     });
 
-    pasteButton.addEventListener("click", async () => {
-        try {
-            await postAction("paste");
-            showToast("已插入到电脑当前窗口。");
-        } catch (error) {
-            showToast(error.message, true);
-        }
-    });
+    if (pasteButton) {
+        pasteButton.addEventListener("click", async () => {
+            try {
+                await pasteIntoComputer();
+                showToast("已插入到电脑当前窗口。");
+            } catch (error) {
+                showToast(error.message, true);
+            }
+        });
+    }
 
     clearButton.addEventListener("click", () => {
         if (!input.value || !confirm("确定清空所有设备上的共享文本吗？")) {

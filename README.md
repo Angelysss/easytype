@@ -2,7 +2,7 @@
 
 EasyType 是一个供家庭 Wi‑Fi 使用的双向共享文本板。手机和 Windows
 电脑在浏览器中编辑同一份文本，修改会实时同步；也可以把当前文本复制到
-Windows 剪贴板，或明确地插入到电脑当前窗口。
+正在使用的手机或电脑剪贴板。
 
 > EasyType 使用局域网 HTTP，只适合可信家庭网络。请勿用它传输密码、
 > 验证码、密钥或其他敏感内容，也不要把端口转发到互联网。
@@ -15,17 +15,31 @@ Windows 剪贴板，或明确地插入到电脑当前窗口。
 - 单一共享文本跨重启保留
 - 可在配对模式与信任模式之间切换
 - 多设备分别配对、单独撤销，配对二维码五分钟有效且只能使用一次
-- 显式复制到 Windows 剪贴板、显式发送 `Ctrl+V`
+- 在当前浏览器设备上复制共享文本
+- 从手机把共享文本插入电脑当前获得焦点的输入框
 - Windows 托盘常驻，无需管理员权限
 
 ## 系统要求
 
 - Windows 10 或 Windows 11
-- Python 3.12+
-- [uv](https://docs.astral.sh/uv/getting-started/installation/)
 - 手机和电脑连接同一个可信家庭 Wi‑Fi
 
-## 安装与启动
+## 直接使用 EXE
+
+普通使用者只需获得 `EasyType-<版本>.exe` 并双击运行，不需要安装 Python、uv，
+也不需要管理员权限。EasyType 会静默运行在系统托盘中；首次启动单文件
+EXE 时，可能需要等待几秒钟完成解压。
+
+当前构建没有商业代码签名证书。通过网络下载后，Windows SmartScreen
+可能显示“未知发布者”；正式公开分发时建议为 EXE 添加代码签名。
+
+首次启动时，如果 Windows 防火墙询问网络访问权限，只允许“专用网络”，
+不要允许“公用网络”。
+
+## 从源码启动
+
+从源码运行需要 Python 3.12+ 和
+[uv](https://docs.astral.sh/uv/getting-started/installation/)。
 
 首次使用，在项目目录运行：
 
@@ -40,9 +54,6 @@ uv sync
 ```powershell
 uv run python main.py
 ```
-
-首次启动时，如果 Windows 防火墙询问网络访问权限，只允许“专用网络”，
-不要允许“公用网络”。
 
 ## 访问模式
 
@@ -74,9 +85,10 @@ uv run python main.py
 - 任意一端修改文本，另一端会自动更新。
 - 两端恰好同时修改时，同步会暂停并要求选择“采用最新内容”或
   “用本机内容覆盖”。
-- “复制”会把完整共享文本写入 Windows 剪贴板。
-- “插入”适合从手机点击；点击前请确保电脑目标输入框拥有焦点。
-  操作后，共享文本会保留在 Windows 剪贴板。
+- “复制”会把完整共享文本写入当前设备的剪贴板：电脑点击复制到电脑，
+  手机点击复制到手机。若浏览器阻止自动复制，可长按文本手动复制。
+- “插入”只显示在手机网页。使用前先在电脑中点选 ChatGPT 等目标输入框，
+  再在手机点击“插入”；EasyType 会把共享文本粘贴到该电脑输入框。
 
 ## 数据与配置
 
@@ -103,8 +115,7 @@ uv run python main.py
 - `GET /api/info`：服务版本、状态和当前修订号
 - `GET /api/document`：当前共享文档
 - `WebSocket /ws`：`snapshot`、`update`、`ack`、`conflict` 和错误事件
-- `POST /api/actions/copy`：复制当前服务端文本
-- `POST /api/actions/paste`：复制当前服务端文本并向当前窗口发送 `Ctrl+V`
+- `POST /api/actions/paste`：仅供已授权手机把共享文本插入电脑当前窗口
 - `PUT /api/admin/access-mode`：仅限本机切换访问模式
 
 配对模式下远程设备必须先授权；信任模式下家庭局域网设备可直接访问。
@@ -119,7 +130,19 @@ uv run pytest
 ```
 
 测试覆盖持久化、版本冲突、配对过期和单次使用、多设备撤销、来源与网段限制、
-剪贴板操作，以及两个真实 WebSocket 客户端之间的同步。
+手机插入操作，以及两个真实 WebSocket 客户端之间的同步。
+
+## 构建 Windows EXE
+
+在 Windows PowerShell 中运行：
+
+```powershell
+.\build-exe.ps1
+```
+
+脚本会安装独立的构建依赖，并输出带版本号的单文件 EXE，例如
+`dist\EasyType-1.0.1.exe`。网页模板、
+前端资源和运行依赖均包含在 EXE 中；最终用户不需要 Python 或 uv。
 
 ## 已知边界
 
