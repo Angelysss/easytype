@@ -8,6 +8,7 @@ import logging
 import os
 import secrets
 import socket
+import sys
 import threading
 import time
 import uuid
@@ -32,7 +33,7 @@ from flask import (
 from flask_sock import Sock
 
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 COOKIE_NAME = "easytype_session"
 COOKIE_MAX_AGE_SECONDS = 180 * 24 * 60 * 60
 MAX_TEXT_BYTES = 1024 * 1024
@@ -379,12 +380,6 @@ class WindowsActions:
     def __init__(self) -> None:
         self._lock = threading.Lock()
 
-    def copy(self, text: str) -> None:
-        import pyperclip
-
-        with self._lock:
-            pyperclip.copy(text)
-
     def paste(self, text: str) -> None:
         import pyautogui
         import pyperclip
@@ -541,6 +536,14 @@ def get_local_ipv4_addresses() -> list[str]:
     return addresses
 
 
+def bundled_resource_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        bundle_dir = getattr(sys, "_MEIPASS", None)
+        if bundle_dir:
+            return Path(bundle_dir)
+    return Path(__file__).resolve().parent
+
+
 def create_app(
     *,
     data_dir: Path | None = None,
@@ -548,7 +551,12 @@ def create_app(
     action_backend: Any | None = None,
     testing: bool = False,
 ) -> Flask:
-    app = Flask(__name__)
+    resource_dir = bundled_resource_dir()
+    app = Flask(
+        __name__,
+        static_folder=str(resource_dir / "static"),
+        template_folder=str(resource_dir / "templates"),
+    )
     app.config.update(
         TESTING=testing,
         JSON_AS_ASCII=False,
@@ -754,27 +762,22 @@ def create_app(
     def api_document() -> Any:
         return jsonify({"ok": True, "document": document_store.snapshot()})
 
-    @app.post("/api/actions/copy")
-    @require_auth
-    @require_mutation_origin
-    def copy_document() -> Any:
-        try:
-            actions.copy(document_store.snapshot()["text"])
-            return jsonify({"ok": True})
-        except Exception:
-            app.logger.exception("Clipboard copy failed.")
-            return jsonify_error("copy_failed", "复制到电脑剪贴板失败。", 500)
-
     @app.post("/api/actions/paste")
     @require_auth
     @require_mutation_origin
     def paste_document() -> Any:
+        if _is_loopback_request():
+            return jsonify_error(
+                "remote_only",
+                "插入功能仅在手机端可用。",
+                403,
+            )
         try:
             actions.paste(document_store.snapshot()["text"])
             return jsonify({"ok": True})
         except Exception:
             app.logger.exception("Paste action failed.")
-            return jsonify_error("paste_failed", "粘贴到当前窗口失败。", 500)
+            return jsonify_error("paste_failed", "插入到电脑当前窗口失败。", 500)
 
     @app.get("/admin")
     @require_local

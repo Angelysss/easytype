@@ -1,0 +1,37 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install build dependencies
+        run: uv sync --group build --locked
+      - name: Verify release version
+        shell: pwsh
+        run: |
+          $version = (uv run --no-sync python -c "from easytype_app import APP_VERSION; print(APP_VERSION)").Trim()
+          if ($env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match source version $version."
+          }
+      - name: Build Windows executable
+        shell: pwsh
+        run: .\build-exe.ps1
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = (uv run --no-sync python -c "from easytype_app import APP_VERSION; print(APP_VERSION)").Trim()
+          gh release create $env:GITHUB_REF_NAME "dist\EasyType-$version.exe" --verify-tag --generate-notes --title "EasyType $env:GITHUB_REF_NAME"

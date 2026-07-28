@@ -74,11 +74,10 @@
                     </a>
                 </div>
                 <div class="about-item">
-                    <strong>“插入”的作用</strong>
+                    <strong>手机端“插入”的作用</strong>
                     <p>
-                        将共享文本复制到运行 EasyType 的 Windows 电脑剪贴板，
-                        再向电脑当前获得焦点的窗口发送 Ctrl+V。使用前请先在电脑上点选目标输入框；
-                        操作完成后，共享文本仍会保留在电脑剪贴板中。
+                        “插入”只显示在手机网页。点击后，运行 EasyType 的 Windows
+                        电脑会把共享文本粘贴到当前获得焦点的输入框中。
                     </p>
                 </div>
             </div>
@@ -179,23 +178,25 @@
                     <span class="editor-meta-separator" aria-hidden="true">|</span>
                     <span id="syncState" title="等待连接">等待连接</span>
                 </div>
-                <div class="editor-action-buttons">
+                <div class="editor-action-buttons{% if not is_local %} remote-actions{% endif %}">
                     <button
                         id="copyButton"
                         class="button secondary"
                         type="button"
-                        title="复制到电脑剪贴板"
+                        title="复制到当前设备剪贴板"
                     >
                         复制
                     </button>
+                    {% if not is_local %}
                     <button
                         id="pasteButton"
                         class="button primary"
                         type="button"
-                        title="将共享文本插入电脑当前窗口"
+                        title="插入到电脑当前窗口"
                     >
                         插入
                     </button>
+                    {% endif %}
                     <button
                         id="clearButton"
                         class="button ghost"
