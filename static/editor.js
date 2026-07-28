@@ -2,11 +2,17 @@
     "use strict";
 
     const MAX_TEXT_BYTES = 1024 * 1024;
-    const DRAFT_KEY = "easytype.pendingDraft.v1";
+    const DRAFTS_KEY = "easytype.pendingDrafts.v2";
     const CLIENT_ID_KEY = "easytype.clientId.v1";
+    const ACTIVE_BOARD_KEY = "easytype.activeBoard.v1";
+    const WORK_MODE_KEY = "easytype.workMode.v1";
+    const DIRECT_FLUSH_DELAY_MS = 45;
     const textEncoder = new TextEncoder();
 
+    const shell = document.querySelector(".editor-shell");
+    const isLocal = shell.dataset.isLocal === "true";
     const input = document.getElementById("sharedText");
+    const editorCard = input.closest(".editor-card");
     const charCount = document.getElementById("charCount");
     const syncState = document.getElementById("syncState");
     const connectionBadge = document.getElementById("connectionBadge");
@@ -15,11 +21,13 @@
     const useRemoteButton = document.getElementById("useRemoteButton");
     const keepLocalButton = document.getElementById("keepLocalButton");
     const copyButton = document.getElementById("copyButton");
+    const remoteEnterButton = document.getElementById("remoteEnterButton");
     const pasteButton = document.getElementById("pasteButton");
     const clearButton = document.getElementById("clearButton");
     const toast = document.getElementById("toast");
     const aboutButton = document.getElementById("aboutButton");
     const aboutPanel = document.getElementById("aboutPanel");
+    const aboutBackdrop = document.getElementById("aboutBackdrop");
     const closeAboutButton = document.getElementById("closeAboutButton");
     const accessSettingsButton = document.getElementById("accessSettingsButton");
     const accessSettingsPanel = document.getElementById("accessSettingsPanel");
@@ -27,20 +35,56 @@
     const saveAccessModeButton = document.getElementById("saveAccessModeButton");
     const deviceManagementLink = document.getElementById("deviceManagementLink");
     const trustedLanAccess = document.getElementById("trustedLanAccess");
+    const boardModeButton = document.getElementById("boardModeButton");
+    const directModeButton = document.getElementById("directModeButton");
+    const boardWorkspace = document.getElementById("boardWorkspace");
+    const directWorkspace = document.getElementById("directWorkspace");
+    const boardTabs = document.getElementById("boardTabs");
+    const addBoardButton = document.getElementById("addBoardButton");
+    const renameBoardButton = document.getElementById("renameBoardButton");
+    const renameBoardDialog = document.getElementById("renameBoardDialog");
+    const renameBoardForm = document.getElementById("renameBoardForm");
+    const renameBoardInput = document.getElementById("renameBoardInput");
+    const cancelRenameBoardButton = document.getElementById(
+        "cancelRenameBoardButton",
+    );
+    const directSurface = document.getElementById("directSurface");
+    const directCapture = document.getElementById("directCapture");
+    const directToggleButton = document.getElementById("directToggleButton");
+    const directStatus = document.getElementById("directStatus");
+    const directHint = document.getElementById("directHint");
+    const directBackspaceButton = document.getElementById("directBackspaceButton");
+    const directEnterButton = document.getElementById("directEnterButton");
 
     const state = {
         socket: null,
-        revision: 0,
-        serverText: "",
-        inFlight: null,
-        conflict: null,
-        flushTimer: null,
+        boards: new Map(),
+        documents: new Map(),
+        activeBoardId: null,
+        workMode: readWorkMode(),
+        maxBoards: Number(shell.dataset.maxBoards) || 8,
+        pendingBoardFocusId: null,
+        deletingBoardId: null,
+        renamingBoardId: null,
+        renameDialogBoardId: null,
         reconnectTimer: null,
         reconnectAttempt: 0,
         manuallyClosed: false,
         initialized: false,
         limitNoticeShown: false,
         clientId: getClientId(),
+        direct: {
+            serverStatus: { active: false },
+            starting: false,
+            active: false,
+            sessionId: null,
+            sequence: 0,
+            acknowledgedText: "",
+            pending: null,
+            pendingKeys: [],
+            composing: false,
+            flushTimer: null,
+        },
     };
 
     function getClientId() {
@@ -54,11 +98,54 @@
         return existing;
     }
 
+    function readWorkMode() {
+        return localStorage.getItem(WORK_MODE_KEY) === "direct"
+            ? "direct"
+            : "board";
+    }
+
+    function socketReady() {
+        return state.socket?.readyState === WebSocket.OPEN;
+    }
+
+    function send(message) {
+        if (!socketReady()) {
+            return false;
+        }
+        state.socket.send(JSON.stringify(message));
+        return true;
+    }
+
     function setConnection(status, label) {
         connectionBadge.className = `status-badge status-${status}`;
         connectionText.textContent = label;
+        updateBoardControls(status === "online");
         if (pasteButton) {
             pasteButton.disabled = status !== "online";
+        }
+        if (remoteEnterButton) {
+            remoteEnterButton.disabled = status !== "online";
+        }
+    }
+
+    function updateBoardControls(online = socketReady()) {
+        const boardCount = state.boards.size;
+        addBoardButton.disabled =
+            !online || boardCount >= state.maxBoards || Boolean(state.deletingBoardId);
+        addBoardButton.title = boardCount >= state.maxBoards
+            ? `最多只能创建 ${state.maxBoards} 个共享板`
+            : "新建共享板";
+        renameBoardButton.disabled =
+            !online ||
+            !state.activeBoardId ||
+            Boolean(state.deletingBoardId) ||
+            Boolean(state.renamingBoardId);
+        for (const closeButton of boardTabs.querySelectorAll(".board-tab-close")) {
+            closeButton.disabled =
+                !online || boardCount <= 1 || Boolean(state.deletingBoardId);
+            closeButton.title = boardCount <= 1
+                ? "至少需要保留一个共享板"
+                : "关闭并删除此共享板";
         }
     }
 
@@ -67,8 +154,575 @@
         syncState.title = label;
     }
 
+    function showToast(message, isError = false) {
+        toast.textContent = message;
+        toast.className = isError ? "toast error" : "toast";
+        toast.hidden = false;
+        clearTimeout(showToast.timer);
+        showToast.timer = setTimeout(() => {
+            toast.hidden = true;
+        }, 2800);
+    }
+
+    function readDrafts() {
+        try {
+            const parsed = JSON.parse(sessionStorage.getItem(DRAFTS_KEY) || "{}");
+            return parsed && typeof parsed === "object" ? parsed : {};
+        } catch (_error) {
+            return {};
+        }
+    }
+
+    function saveDraft(boardId, text, baseRevision) {
+        const drafts = readDrafts();
+        drafts[boardId] = { text, baseRevision };
+        sessionStorage.setItem(DRAFTS_KEY, JSON.stringify(drafts));
+    }
+
+    function getDraft(boardId) {
+        const draft = readDrafts()[boardId];
+        if (
+            draft &&
+            typeof draft.text === "string" &&
+            Number.isInteger(draft.baseRevision)
+        ) {
+            return draft;
+        }
+        return null;
+    }
+
+    function clearDraft(boardId) {
+        const drafts = readDrafts();
+        delete drafts[boardId];
+        sessionStorage.setItem(DRAFTS_KEY, JSON.stringify(drafts));
+    }
+
+    function ensureDocument(boardId) {
+        if (!state.documents.has(boardId)) {
+            state.documents.set(boardId, {
+                initialized: false,
+                serverText: "",
+                localText: "",
+                revision: 0,
+                updatedAt: "",
+                inFlight: null,
+                conflict: null,
+                flushTimer: null,
+            });
+        }
+        return state.documents.get(boardId);
+    }
+
+    function updateBoardMetadata(document) {
+        const previous = state.boards.get(document.id) || {};
+        state.boards.set(document.id, {
+            ...previous,
+            id: document.id,
+            number: document.number,
+            name: document.name,
+            revision: document.revision,
+            updatedAt: document.updatedAt,
+            unread: document.id === state.activeBoardId ? false : previous.unread,
+        });
+    }
+
+    function renderBoardTabs() {
+        boardTabs.replaceChildren();
+        const boards = [...state.boards.values()].sort(
+            (left, right) => left.number - right.number,
+        );
+        for (const board of boards) {
+            const tabContainer = document.createElement("div");
+            tabContainer.className = "board-tab-container";
+            tabContainer.dataset.boardId = board.id;
+
+            const selectButton = document.createElement("button");
+            selectButton.type = "button";
+            selectButton.className = "board-tab";
+            selectButton.textContent = board.name;
+            selectButton.title = board.name;
+            selectButton.setAttribute(
+                "aria-selected",
+                String(board.id === state.activeBoardId),
+            );
+            selectButton.addEventListener("click", () => selectBoard(board.id, {
+                focusEditor: true,
+            }));
+
+            let cornerControl;
+            if (board.unread) {
+                cornerControl = document.createElement("span");
+                cornerControl.className = "board-tab-corner board-tab-update";
+                cornerControl.setAttribute("aria-label", `${board.name}有新内容`);
+            } else {
+                cornerControl = document.createElement("button");
+                cornerControl.type = "button";
+                cornerControl.className = "board-tab-corner board-tab-close";
+                cornerControl.textContent = "×";
+                cornerControl.setAttribute("aria-label", `关闭并删除${board.name}`);
+                cornerControl.addEventListener(
+                    "click",
+                    () => requestDeleteBoard(board.id),
+                );
+            }
+
+            tabContainer.append(selectButton, cornerControl);
+            boardTabs.append(tabContainer);
+        }
+        updateBoardControls();
+    }
+
+    function requestRenameBoard(boardId) {
+        const board = state.boards.get(boardId);
+        if (!board || !socketReady()) {
+            showToast("连接恢复后才能重命名共享板。", true);
+            return;
+        }
+        state.renameDialogBoardId = boardId;
+        renameBoardInput.value = board.name;
+        renameBoardDialog.showModal();
+        renameBoardInput.focus();
+        renameBoardInput.select();
+    }
+
+    function submitBoardRename() {
+        const boardId = state.renameDialogBoardId;
+        const board = state.boards.get(boardId);
+        const normalizedName = renameBoardInput.value.trim().replace(/\s+/g, " ");
+        if (!normalizedName || [...normalizedName].length > 24) {
+            showToast("名称不能为空，且最多为 24 个字符。", true);
+            renameBoardInput.focus();
+            return;
+        }
+        renameBoardDialog.close();
+        state.renameDialogBoardId = null;
+        if (!board || normalizedName === board.name) {
+            return;
+        }
+        state.renamingBoardId = boardId;
+        updateBoardControls();
+        if (!send({
+            type: "rename_board",
+            boardId,
+            name: normalizedName,
+            clientId: state.clientId,
+        })) {
+            state.renamingBoardId = null;
+            updateBoardControls();
+            showToast("连接恢复后才能重命名共享板。", true);
+        }
+    }
+
+    function closeRenameBoardDialog() {
+        state.renameDialogBoardId = null;
+        if (renameBoardDialog.open) {
+            renameBoardDialog.close();
+        }
+    }
+
+    function requestDeleteBoard(boardId) {
+        if (state.boards.size <= 1) {
+            showToast("至少需要保留一个共享板。", true);
+            return;
+        }
+        const board = state.boards.get(boardId);
+        if (
+            !board ||
+            !confirm(`确定删除“${board.name}”吗？其中的内容将无法恢复。`)
+        ) {
+            return;
+        }
+        state.deletingBoardId = board.id;
+        updateBoardControls();
+        if (!send({
+            type: "delete_board",
+            boardId: board.id,
+            clientId: state.clientId,
+        })) {
+            state.deletingBoardId = null;
+            updateBoardControls();
+            showToast("连接恢复后才能删除共享板。", true);
+        }
+    }
+
+    function activeDocument() {
+        return state.activeBoardId
+            ? ensureDocument(state.activeBoardId)
+            : null;
+    }
+
     function updateMeta() {
         charCount.textContent = `${input.value.length} 字符`;
+    }
+
+    function updateSyncFromDocument(documentState) {
+        if (!documentState) {
+            setSync("等待共享板");
+        } else if (documentState.conflict) {
+            setSync("等待处理冲突");
+        } else if (documentState.inFlight) {
+            setSync("正在同步");
+        } else if (documentState.localText !== documentState.serverText) {
+            setSync(socketReady() ? "等待同步" : "离线修改待发送");
+        } else {
+            setSync("已同步");
+        }
+    }
+
+    function renderActiveDocument({ preserveSelection = false } = {}) {
+        const documentState = activeDocument();
+        if (!documentState?.initialized) {
+            input.value = "";
+            input.disabled = true;
+            setSync("正在读取共享板");
+            updateMeta();
+            conflictPanel.hidden = true;
+            return;
+        }
+
+        const wasFocused = document.activeElement === input;
+        const selectionStart = input.selectionStart;
+        const selectionEnd = input.selectionEnd;
+        input.disabled = false;
+        input.value = documentState.localText;
+        if (preserveSelection && wasFocused) {
+            focusElement(input);
+            input.setSelectionRange(
+                Math.min(selectionStart, input.value.length),
+                Math.min(selectionEnd, input.value.length),
+            );
+        }
+        updateMeta();
+        conflictPanel.hidden = !documentState.conflict;
+        updateSyncFromDocument(documentState);
+    }
+
+    function focusElement(element) {
+        try {
+            element.focus({ preventScroll: true });
+        } catch (_error) {
+            element.focus();
+        }
+    }
+
+    function focusSharedInput({ moveCursorToEnd = true } = {}) {
+        if (
+            state.workMode !== "board" ||
+            input.disabled ||
+            !activeDocument()?.initialized
+        ) {
+            return false;
+        }
+        focusElement(input);
+        if (moveCursorToEnd) {
+            const cursor = input.value.length;
+            input.setSelectionRange(cursor, cursor);
+        }
+        return document.activeElement === input;
+    }
+
+    function reactivateEmptySharedInput() {
+        if (
+            input.value ||
+            input.disabled ||
+            state.workMode !== "board" ||
+            !activeDocument()?.initialized
+        ) {
+            return;
+        }
+        // Some mobile browsers keep an empty textarea as document.activeElement
+        // after hiding the keyboard. Refocusing inside the next user gesture
+        // makes the virtual keyboard available again.
+        if (document.activeElement === input) {
+            input.blur();
+        }
+        focusSharedInput({ moveCursorToEnd: false });
+        input.setSelectionRange(0, 0);
+    }
+
+    function applyBoardSnapshot(document) {
+        const documentState = ensureDocument(document.id);
+        const existingDirty =
+            documentState.initialized &&
+            documentState.localText !== documentState.serverText;
+        const draft = getDraft(document.id);
+
+        if (
+            existingDirty &&
+            document.revision !== documentState.revision
+        ) {
+            documentState.conflict = {
+                localText: documentState.localText,
+                remote: document,
+            };
+            documentState.serverText = document.text;
+            documentState.revision = document.revision;
+            documentState.updatedAt = document.updatedAt;
+        } else if (
+            !documentState.initialized &&
+            draft &&
+            draft.text !== document.text
+        ) {
+            documentState.serverText = document.text;
+            documentState.revision = document.revision;
+            documentState.updatedAt = document.updatedAt;
+            if (draft.baseRevision === document.revision) {
+                documentState.localText = draft.text;
+            } else {
+                documentState.localText = draft.text;
+                documentState.conflict = {
+                    localText: draft.text,
+                    remote: document,
+                };
+            }
+        } else if (!existingDirty) {
+            documentState.serverText = document.text;
+            documentState.localText = document.text;
+            documentState.revision = document.revision;
+            documentState.updatedAt = document.updatedAt;
+            documentState.conflict = null;
+            clearDraft(document.id);
+        }
+
+        documentState.initialized = true;
+        updateBoardMetadata(document);
+        if (document.id === state.activeBoardId) {
+            renderActiveDocument({ preserveSelection: true });
+            if (state.pendingBoardFocusId === document.id) {
+                state.pendingBoardFocusId = null;
+                focusSharedInput();
+            }
+        }
+        renderBoardTabs();
+        if (
+            !documentState.conflict &&
+            documentState.localText !== documentState.serverText
+        ) {
+            scheduleFlush(document.id, 30);
+        }
+    }
+
+    function selectBoard(boardId, { focusEditor = false } = {}) {
+        if (!state.boards.has(boardId)) {
+            return;
+        }
+        const current = activeDocument();
+        if (current?.initialized) {
+            current.localText = input.value;
+            if (current.localText !== current.serverText) {
+                saveDraft(
+                    state.activeBoardId,
+                    current.localText,
+                    current.revision,
+                );
+                scheduleFlush(state.activeBoardId, 0);
+            }
+        }
+
+        state.activeBoardId = boardId;
+        localStorage.setItem(ACTIVE_BOARD_KEY, boardId);
+        const board = state.boards.get(boardId);
+        board.unread = false;
+        renderBoardTabs();
+        renderActiveDocument();
+        if (focusEditor) {
+            if (!focusSharedInput()) {
+                state.pendingBoardFocusId = boardId;
+            }
+        }
+        send({ type: "select_board", boardId });
+    }
+
+    function scheduleFlush(boardId, delay = 200) {
+        const documentState = ensureDocument(boardId);
+        clearTimeout(documentState.flushTimer);
+        documentState.flushTimer = setTimeout(() => flush(boardId), delay);
+    }
+
+    function flush(boardId) {
+        const documentState = ensureDocument(boardId);
+        clearTimeout(documentState.flushTimer);
+        documentState.flushTimer = null;
+        if (
+            !documentState.initialized ||
+            documentState.conflict ||
+            documentState.inFlight
+        ) {
+            return;
+        }
+        if (!socketReady()) {
+            if (boardId === state.activeBoardId) {
+                setSync("离线修改待发送");
+            }
+            return;
+        }
+        if (documentState.localText === documentState.serverText) {
+            clearDraft(boardId);
+            if (boardId === state.activeBoardId) {
+                setSync("已同步");
+            }
+            return;
+        }
+        if (
+            textEncoder.encode(documentState.localText).byteLength >
+            MAX_TEXT_BYTES
+        ) {
+            if (boardId === state.activeBoardId) {
+                setSync("内容超过 1 MiB");
+                showToast("内容已达到上限，暂未同步。", true);
+            }
+            return;
+        }
+
+        documentState.inFlight = {
+            text: documentState.localText,
+            baseRevision: documentState.revision,
+        };
+        saveDraft(
+            boardId,
+            documentState.inFlight.text,
+            documentState.inFlight.baseRevision,
+        );
+        send({
+            type: "update",
+            clientId: state.clientId,
+            boardId,
+            baseRevision: documentState.inFlight.baseRevision,
+            text: documentState.inFlight.text,
+        });
+        if (boardId === state.activeBoardId) {
+            setSync("正在同步");
+        }
+    }
+
+    function handleAcknowledgement(message) {
+        const documentState = ensureDocument(message.boardId);
+        if (!documentState.inFlight) {
+            return;
+        }
+        documentState.serverText = documentState.inFlight.text;
+        documentState.revision = message.revision;
+        documentState.updatedAt = message.updatedAt;
+        documentState.inFlight = null;
+        const board = state.boards.get(message.boardId);
+        if (board) {
+            board.revision = message.revision;
+            board.updatedAt = message.updatedAt;
+        }
+        if (documentState.localText === documentState.serverText) {
+            clearDraft(message.boardId);
+        } else {
+            scheduleFlush(message.boardId, 30);
+        }
+        if (message.boardId === state.activeBoardId) {
+            updateSyncFromDocument(documentState);
+        }
+        renderBoardTabs();
+    }
+
+    function handleRemoteUpdate(message) {
+        const document = message.document;
+        const documentState = ensureDocument(document.id);
+        const hasLocalChange =
+            documentState.inFlight ||
+            documentState.localText !== documentState.serverText;
+
+        if (hasLocalChange && document.text !== documentState.localText) {
+            documentState.inFlight = null;
+            documentState.conflict = {
+                localText: documentState.localText,
+                remote: document,
+            };
+            documentState.serverText = document.text;
+            documentState.revision = document.revision;
+            documentState.updatedAt = document.updatedAt;
+        } else {
+            documentState.serverText = document.text;
+            documentState.localText = document.text;
+            documentState.revision = document.revision;
+            documentState.updatedAt = document.updatedAt;
+            documentState.inFlight = null;
+            documentState.conflict = null;
+            clearDraft(document.id);
+        }
+        documentState.initialized = true;
+        updateBoardMetadata(document);
+        if (document.id === state.activeBoardId) {
+            renderActiveDocument({ preserveSelection: true });
+        }
+        renderBoardTabs();
+    }
+
+    function handleBoardDeleted(message) {
+        const boardId = message.boardId;
+        const wasActive = boardId === state.activeBoardId;
+        const deletedDocument = state.documents.get(boardId);
+        if (deletedDocument) {
+            clearTimeout(deletedDocument.flushTimer);
+        }
+        state.boards.delete(boardId);
+        state.documents.delete(boardId);
+        clearDraft(boardId);
+        if (state.deletingBoardId === boardId) {
+            state.deletingBoardId = null;
+        }
+        if (state.renameDialogBoardId === boardId) {
+            closeRenameBoardDialog();
+        }
+
+        if (wasActive && message.fallback) {
+            state.activeBoardId = message.fallback.id;
+            localStorage.setItem(ACTIVE_BOARD_KEY, message.fallback.id);
+            state.pendingBoardFocusId = message.sourceId === state.clientId
+                ? message.fallback.id
+                : null;
+            applyBoardSnapshot(message.fallback);
+            send({
+                type: "select_board",
+                boardId: message.fallback.id,
+            });
+        } else {
+            renderBoardTabs();
+        }
+        updateBoardControls();
+        if (message.sourceId === state.clientId) {
+            showToast("当前共享板已删除。");
+        }
+    }
+
+    function resolveWithRemote() {
+        const documentState = activeDocument();
+        if (!documentState?.conflict) {
+            return;
+        }
+        const remote = documentState.conflict.remote;
+        documentState.serverText = remote.text;
+        documentState.localText = remote.text;
+        documentState.revision = remote.revision;
+        documentState.updatedAt = remote.updatedAt;
+        documentState.conflict = null;
+        documentState.inFlight = null;
+        clearDraft(state.activeBoardId);
+        renderActiveDocument();
+        showToast("已采用最新内容。");
+    }
+
+    function resolveWithLocal() {
+        const documentState = activeDocument();
+        if (!documentState?.conflict) {
+            return;
+        }
+        const localText = documentState.conflict.localText;
+        const remote = documentState.conflict.remote;
+        documentState.serverText = remote.text;
+        documentState.localText = localText;
+        documentState.revision = remote.revision;
+        documentState.updatedAt = remote.updatedAt;
+        documentState.conflict = null;
+        documentState.inFlight = null;
+        saveDraft(state.activeBoardId, localText, remote.revision);
+        renderActiveDocument();
+        scheduleFlush(state.activeBoardId, 0);
     }
 
     function notifyWhenLimitIsReached() {
@@ -89,84 +743,47 @@
         state.limitNoticeShown = true;
     }
 
-    function showToast(message, isError = false) {
-        toast.textContent = message;
-        toast.className = isError ? "toast error" : "toast";
-        toast.hidden = false;
-        clearTimeout(showToast.timer);
-        showToast.timer = setTimeout(() => {
-            toast.hidden = true;
-        }, 2600);
-    }
-
-    function currentDraft() {
-        try {
-            const raw = sessionStorage.getItem(DRAFT_KEY);
-            if (!raw) {
-                return null;
+    function applyWorkMode(mode, { focusEditor = false } = {}) {
+        if (mode !== "board" && mode !== "direct") {
+            mode = "board";
+        }
+        const leavingDirect =
+            mode === "board" &&
+            (state.direct.active || state.direct.starting);
+        if (leavingDirect) {
+            stopDirect();
+        }
+        state.workMode = mode;
+        localStorage.setItem(WORK_MODE_KEY, mode);
+        const boardMode = mode === "board";
+        boardWorkspace.hidden = !boardMode;
+        directWorkspace.hidden = boardMode;
+        boardModeButton.setAttribute("aria-pressed", String(boardMode));
+        directModeButton.setAttribute("aria-pressed", String(!boardMode));
+        if (boardMode && state.activeBoardId) {
+            renderActiveDocument();
+        }
+        if (boardMode && focusEditor) {
+            if (!focusSharedInput()) {
+                state.pendingBoardFocusId = state.activeBoardId;
             }
-            const parsed = JSON.parse(raw);
-            if (
-                typeof parsed.text === "string" &&
-                Number.isInteger(parsed.baseRevision)
-            ) {
-                return parsed;
-            }
-        } catch (_error) {
-            // Ignore an invalid session draft.
         }
-        return null;
+        renderDirectStatus();
     }
 
-    function saveDraft(text = input.value, baseRevision = state.revision) {
-        sessionStorage.setItem(
-            DRAFT_KEY,
-            JSON.stringify({ text, baseRevision }),
-        );
+    function requestWorkMode(mode) {
+        applyWorkMode(mode, {
+            focusEditor: mode === "board",
+        });
     }
 
-    function clearDraft() {
-        sessionStorage.removeItem(DRAFT_KEY);
-    }
-
-    function scheduleFlush(delay = 200) {
-        clearTimeout(state.flushTimer);
-        state.flushTimer = setTimeout(flush, delay);
-    }
-
-    function flush() {
-        clearTimeout(state.flushTimer);
-        state.flushTimer = null;
-        if (state.conflict || state.inFlight) {
-            return;
+    function graphemes(text) {
+        if (globalThis.Intl?.Segmenter) {
+            return [...new Intl.Segmenter(undefined, {
+                granularity: "grapheme",
+            }).segment(text)].map((item) => item.segment);
         }
-        if (!state.socket || state.socket.readyState !== WebSocket.OPEN) {
-            setSync("离线修改待发送");
-            return;
-        }
-        if (input.value === state.serverText) {
-            clearDraft();
-            setSync("已同步");
-            return;
-        }
-        if (textEncoder.encode(input.value).byteLength > MAX_TEXT_BYTES) {
-            setSync("内容超过 1 MiB");
-            showToast("内容超过 1 MiB，暂未同步。", true);
-            return;
-        }
-
-        state.inFlight = {
-            text: input.value,
-            baseRevision: state.revision,
-        };
-        saveDraft(state.inFlight.text, state.inFlight.baseRevision);
-        state.socket.send(JSON.stringify({
-            type: "update",
-            clientId: state.clientId,
-            baseRevision: state.inFlight.baseRevision,
-            text: state.inFlight.text,
-        }));
-        setSync("正在同步");
+        return [...text];
     }
 
     function commonPrefixLength(left, right) {
@@ -178,220 +795,516 @@
         return index;
     }
 
-    function commonSuffixLength(left, right, prefixLength) {
-        const limit = Math.min(left.length, right.length) - prefixLength;
-        let count = 0;
-        while (
-            count < limit &&
-            left[left.length - 1 - count] === right[right.length - 1 - count]
-        ) {
-            count += 1;
+    function renderDirectStatus() {
+        directSurface.classList.remove("is-active", "is-waiting", "is-error");
+        const activeDirectKeysEnabled =
+            !isLocal &&
+            state.direct.active &&
+            !state.direct.pending &&
+            state.direct.pendingKeys.length === 0 &&
+            !state.direct.composing &&
+            directCapture.value === state.direct.acknowledgedText;
+        const idleDirectKeysEnabled =
+            !isLocal &&
+            !state.direct.active &&
+            !state.direct.starting &&
+            !state.direct.serverStatus.active &&
+            socketReady();
+        const directKeysEnabled =
+            activeDirectKeysEnabled || idleDirectKeysEnabled;
+        if (directBackspaceButton) {
+            directBackspaceButton.disabled = !directKeysEnabled;
         }
-        return count;
-    }
-
-    function applyRemoteText(nextText) {
-        const previousText = input.value;
-        const wasFocused = document.activeElement === input;
-        const selectionStart = input.selectionStart;
-        const selectionEnd = input.selectionEnd;
-        const prefix = commonPrefixLength(previousText, nextText);
-        const suffix = commonSuffixLength(previousText, nextText, prefix);
-
-        input.value = nextText;
-        if (wasFocused) {
-            const oldChangedEnd = previousText.length - suffix;
-            const newChangedEnd = nextText.length - suffix;
-            const mapPosition = (position) => {
-                if (position <= prefix) {
-                    return position;
-                }
-                if (position >= oldChangedEnd) {
-                    return Math.max(0, position + nextText.length - previousText.length);
-                }
-                return newChangedEnd;
-            };
-            input.setSelectionRange(
-                mapPosition(selectionStart),
-                mapPosition(selectionEnd),
+        if (directEnterButton) {
+            directEnterButton.disabled = !directKeysEnabled;
+        }
+        if (directToggleButton) {
+            const toggled = state.direct.active || state.direct.starting;
+            directToggleButton.setAttribute("aria-pressed", String(toggled));
+            directToggleButton.setAttribute(
+                "aria-label",
+                toggled ? "停止直输" : "开启直输",
             );
         }
-        updateMeta();
-    }
-
-    function acceptSnapshot(documentState) {
-        state.revision = documentState.revision;
-        state.serverText = documentState.text;
-        state.inFlight = null;
-        updateMeta();
-
-        const draft = currentDraft();
-        if (!draft || draft.text === documentState.text) {
-            applyRemoteText(documentState.text);
-            clearDraft();
-            setSync("已同步");
-        } else if (draft.baseRevision === documentState.revision) {
-            input.value = draft.text;
-            updateMeta();
-            setSync("正在发送离线修改");
-            scheduleFlush(0);
-        } else {
-            enterConflict(documentState, draft.text);
+        if (isLocal) {
+            if (state.direct.serverStatus.active) {
+                directSurface.classList.add("is-active");
+                directStatus.textContent =
+                    `${state.direct.serverStatus.deviceName || "手机"} 正在直输`;
+                directHint.textContent = "电脑当前窗口正在接收模拟输入";
+            } else {
+                directStatus.textContent = "请在手机上开启直输";
+                directHint.textContent = "电脑会显示当前直输状态";
+            }
+            return;
         }
-        state.initialized = true;
+        if (state.direct.active) {
+            directSurface.classList.add("is-active");
+            directStatus.textContent = "正在直输";
+            directHint.textContent = "再次点击波浪即可停止";
+        } else if (state.direct.starting) {
+            directSurface.classList.add("is-waiting");
+            directStatus.textContent = "正在连接电脑窗口";
+            directHint.textContent = "请保持电脑目标输入框获得焦点";
+        } else if (state.direct.serverStatus.active) {
+            directSurface.classList.add("is-waiting");
+            directStatus.textContent =
+                `${state.direct.serverStatus.deviceName || "另一台设备"} 正在直输`;
+            directHint.textContent = "当前直输会话结束后可以重新开启";
+        } else {
+            directStatus.textContent = "点击波浪开启直输";
+            directHint.textContent = "开启后可使用手机语音输入";
+        }
     }
 
-    function receiveUpdate(documentState) {
-        if (documentState.revision <= state.revision) {
+    function resetDirectState({ clearCapture = true } = {}) {
+        clearTimeout(state.direct.flushTimer);
+        state.direct.flushTimer = null;
+        state.direct.starting = false;
+        state.direct.active = false;
+        state.direct.sessionId = null;
+        state.direct.sequence = 0;
+        state.direct.acknowledgedText = "";
+        state.direct.pending = null;
+        state.direct.pendingKeys = [];
+        state.direct.composing = false;
+        if (directCapture && clearCapture) {
+            directCapture.value = "";
+            directCapture.blur();
+        }
+        renderDirectStatus();
+    }
+
+    function startDirect() {
+        if (
+            isLocal ||
+            state.workMode !== "direct" ||
+            state.direct.starting ||
+            state.direct.active
+        ) {
+            return;
+        }
+        if (!socketReady()) {
+            showToast("连接恢复后才能开启直输。", true);
+            directCapture.blur();
+            return;
+        }
+        if (state.direct.serverStatus.active) {
+            showToast("另一台设备正在使用直输。", true);
+            directCapture.blur();
+            return;
+        }
+        directCapture.value = "";
+        state.direct.starting = true;
+        state.direct.acknowledgedText = "";
+        state.direct.pending = null;
+        renderDirectStatus();
+        send({ type: "direct_start" });
+    }
+
+    function stopDirect() {
+        if (state.direct.active || state.direct.starting) {
+            send({
+                type: "direct_stop",
+                sessionId: state.direct.sessionId,
+            });
+        }
+        resetDirectState();
+    }
+
+    function scheduleDirectFlush(delay = DIRECT_FLUSH_DELAY_MS) {
+        if (state.direct.flushTimer !== null) {
+            return;
+        }
+        state.direct.flushTimer = setTimeout(flushDirect, delay);
+    }
+
+    function flushDirect() {
+        clearTimeout(state.direct.flushTimer);
+        state.direct.flushTimer = null;
+        if (
+            !state.direct.active ||
+            state.direct.pending ||
+            state.direct.pendingKeys.length > 0 ||
+            state.direct.composing ||
+            !socketReady()
+        ) {
+            return;
+        }
+        const desiredText = directCapture.value;
+        const acknowledged = state.direct.acknowledgedText;
+        if (desiredText === acknowledged) {
+            return;
+        }
+        const acknowledgedParts = graphemes(acknowledged);
+        const desiredParts = graphemes(desiredText);
+        const prefixLength = commonPrefixLength(
+            acknowledgedParts,
+            desiredParts,
+        );
+        const removed = acknowledgedParts.slice(prefixLength);
+        const inserted = desiredParts.slice(prefixLength).join("");
+        const sequence = state.direct.sequence + 1;
+        state.direct.sequence = sequence;
+        state.direct.pending = {
+            sequence,
+            targetText: desiredText,
+        };
+        renderDirectStatus();
+        send({
+            type: "direct_input",
+            sessionId: state.direct.sessionId,
+            sequence,
+            deleteCount: removed.length,
+            text: inserted,
+        });
+    }
+
+    function handleDirectAcknowledgement(message) {
+        if (
+            !state.direct.pending ||
+            message.sessionId !== state.direct.sessionId ||
+            message.sequence !== state.direct.pending.sequence
+        ) {
+            return;
+        }
+        state.direct.acknowledgedText = state.direct.pending.targetText;
+        state.direct.pending = null;
+        renderDirectStatus();
+        if (
+            state.direct.pendingKeys.length === 0 &&
+            directCapture.value !== state.direct.acknowledgedText
+        ) {
+            scheduleDirectFlush(25);
+        }
+    }
+
+    function applyDirectKeyToText(text, key) {
+        if (key === "enter") {
+            return "";
+        }
+        const parts = graphemes(text);
+        parts.pop();
+        return parts.join("");
+    }
+
+    async function sendDirectKeyWithoutSession(key) {
+        const response = await fetch("/api/actions/key", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ key }),
+        });
+        if (response.status === 401) {
+            location.assign("/pair");
+            return false;
+        }
+        const payload = await response.json();
+        if (!response.ok) {
+            throw new Error(payload.error?.message ?? "发送电脑按键失败。");
+        }
+        return true;
+    }
+
+    async function triggerDirectKey(key) {
+        if (!socketReady()) {
+            showToast("连接恢复后才能发送电脑按键。", true);
+            return;
+        }
+        if (!state.direct.active) {
+            if (state.direct.starting || state.direct.serverStatus.active) {
+                showToast("另一台设备正在使用直输。", true);
+                return;
+            }
+            try {
+                if (await sendDirectKeyWithoutSession(key)) {
+                    showToast(key === "enter"
+                        ? "已发送电脑回车。"
+                        : "已发送电脑退格。");
+                }
+            } catch (error) {
+                showToast(error.message, true);
+            }
             return;
         }
         if (
-            state.conflict ||
-            state.inFlight ||
-            input.value !== state.serverText
+            state.direct.pending ||
+            state.direct.pendingKeys.length > 0 ||
+            state.direct.composing ||
+            directCapture.value !== state.direct.acknowledgedText
         ) {
-            enterConflict(documentState, input.value);
+            showToast("文字仍在发送，请稍后再按。", true);
             return;
         }
-        state.revision = documentState.revision;
-        state.serverText = documentState.text;
-        applyRemoteText(documentState.text);
-        clearDraft();
-        setSync("已同步");
+        const requestId = globalThis.crypto?.randomUUID?.() ??
+            `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        state.direct.pendingKeys.push({ requestId, key });
+        directCapture.value = applyDirectKeyToText(directCapture.value, key);
+        renderDirectStatus();
+        if (!send({
+            type: "direct_key",
+            sessionId: state.direct.sessionId,
+            requestId,
+            key,
+        })) {
+            state.direct.pendingKeys = [];
+            resetDirectState();
+            showToast("连接已断开，直输已停止。", true);
+        }
+        directCapture.focus({ preventScroll: true });
     }
 
-    function acknowledge(message) {
-        if (!state.inFlight) {
-            state.revision = Math.max(state.revision, message.revision);
-            updateMeta();
+    function handleDirectKeyAcknowledgement(message) {
+        const pendingIndex = state.direct.pendingKeys.findIndex(
+            (item) => item.requestId === message.requestId,
+        );
+        if (
+            pendingIndex < 0 ||
+            message.sessionId !== state.direct.sessionId
+        ) {
             return;
         }
-        state.revision = message.revision;
-        state.serverText = state.inFlight.text;
-        state.inFlight = null;
-        updateMeta();
-
-        if (input.value === state.serverText) {
-            clearDraft();
-            setSync("已同步");
-        } else {
-            saveDraft(input.value, state.revision);
-            scheduleFlush(0);
+        const [pendingKey] = state.direct.pendingKeys.splice(pendingIndex, 1);
+        state.direct.acknowledgedText = applyDirectKeyToText(
+            state.direct.acknowledgedText,
+            pendingKey.key,
+        );
+        renderDirectStatus();
+        if (
+            !state.direct.pending &&
+            state.direct.pendingKeys.length === 0 &&
+            directCapture.value !== state.direct.acknowledgedText
+        ) {
+            scheduleDirectFlush(25);
         }
     }
 
-    function enterConflict(documentState, localText) {
-        state.inFlight = null;
-        state.conflict = {
-            remote: documentState,
-            localText,
-        };
-        saveDraft(localText, state.revision);
-        conflictPanel.hidden = false;
-        setSync("同步冲突，等待选择");
+    function handleSocketError(message) {
+        const directCodes = new Set([
+            "direct_busy",
+            "direct_inactive",
+            "direct_input_failed",
+            "direct_key_failed",
+            "focus_changed",
+            "invalid_direct_key",
+            "remote_only",
+            "sequence_gap",
+            "target_unavailable",
+        ]);
+        if (directCodes.has(message.code)) {
+            resetDirectState();
+        }
+        if (
+            message.code === "board_not_found" ||
+            message.code === "last_board_required" ||
+            message.code === "invalid_board_name"
+        ) {
+            state.deletingBoardId = null;
+            state.renamingBoardId = null;
+            updateBoardControls();
+        }
+        showToast(message.message || "操作失败。", true);
     }
 
-    function resolveWithRemote() {
-        if (!state.conflict) {
+    function handleMessage(message) {
+        if (message.type === "snapshot") {
+            state.initialized = true;
+            state.boards.clear();
+            for (const board of message.boards || []) {
+                state.boards.set(board.id, { ...board, unread: false });
+            }
+            state.direct.serverStatus = message.direct || { active: false };
+
+            const savedBoard = localStorage.getItem(ACTIVE_BOARD_KEY);
+            const preferredBoard = state.boards.has(savedBoard)
+                ? savedBoard
+                : message.document.id;
+            state.activeBoardId = preferredBoard;
+            applyBoardSnapshot(message.document);
+            renderBoardTabs();
+            if (preferredBoard !== message.document.id) {
+                renderActiveDocument();
+                send({ type: "select_board", boardId: preferredBoard });
+            } else {
+                renderActiveDocument();
+            }
+            for (const boardId of state.documents.keys()) {
+                const documentState = ensureDocument(boardId);
+                if (
+                    documentState.initialized &&
+                    documentState.localText !== documentState.serverText
+                ) {
+                    scheduleFlush(boardId, 30);
+                }
+            }
+            renderDirectStatus();
             return;
         }
-        const remote = state.conflict.remote;
-        state.conflict = null;
-        state.revision = remote.revision;
-        state.serverText = remote.text;
-        applyRemoteText(remote.text);
-        clearDraft();
-        conflictPanel.hidden = true;
-        setSync("已采用最新内容");
-    }
-
-    function resolveWithLocal() {
-        if (!state.conflict) {
+        if (message.type === "board_snapshot") {
+            applyBoardSnapshot(message.document);
             return;
         }
-        const { remote, localText } = state.conflict;
-        state.conflict = null;
-        state.revision = remote.revision;
-        state.serverText = remote.text;
-        input.value = localText;
-        updateMeta();
-        saveDraft(localText, state.revision);
-        conflictPanel.hidden = true;
-        setSync("正在用本机内容覆盖");
-        scheduleFlush(0);
-    }
-
-    function handleSocketMessage(event) {
-        let message;
-        try {
-            message = JSON.parse(event.data);
-        } catch (_error) {
-            showToast("收到无法解析的服务器消息。", true);
+        if (message.type === "ack") {
+            handleAcknowledgement(message);
             return;
         }
-        switch (message.type) {
-            case "snapshot":
-                acceptSnapshot(message.document);
-                break;
-            case "update":
-                receiveUpdate(message.document);
-                break;
-            case "ack":
-                acknowledge(message);
-                break;
-            case "conflict":
-                enterConflict(
-                    message.document,
-                    state.inFlight?.text ?? input.value,
-                );
-                break;
-            case "error":
-                state.inFlight = null;
-                setSync("同步失败");
-                showToast(message.error?.message ?? "同步失败。", true);
-                break;
-            case "pong":
-                break;
-            default:
-                showToast("收到未知服务器消息。", true);
+        if (message.type === "update") {
+            handleRemoteUpdate(message);
+            return;
+        }
+        if (message.type === "conflict") {
+            const documentState = ensureDocument(message.boardId);
+            documentState.inFlight = null;
+            documentState.conflict = {
+                localText: documentState.localText,
+                remote: message.document,
+            };
+            documentState.serverText = message.document.text;
+            documentState.revision = message.document.revision;
+            documentState.updatedAt = message.document.updatedAt;
+            updateBoardMetadata(message.document);
+            if (message.boardId === state.activeBoardId) {
+                renderActiveDocument();
+            }
+            renderBoardTabs();
+            return;
+        }
+        if (message.type === "board_updated") {
+            const previous = state.boards.get(message.board.id) || {};
+            state.boards.set(message.board.id, {
+                ...previous,
+                ...message.board,
+                unread: message.board.id !== state.activeBoardId,
+            });
+            renderBoardTabs();
+            return;
+        }
+        if (message.type === "board_created") {
+            state.boards.set(message.board.id, {
+                ...message.board,
+                unread: message.sourceId !== state.clientId,
+            });
+            renderBoardTabs();
+            if (message.sourceId === state.clientId) {
+                selectBoard(message.board.id, { focusEditor: true });
+            }
+            return;
+        }
+        if (message.type === "board_renamed") {
+            const previous = state.boards.get(message.board.id);
+            if (previous) {
+                state.boards.set(message.board.id, {
+                    ...previous,
+                    ...message.board,
+                });
+            }
+            if (state.renamingBoardId === message.board.id) {
+                state.renamingBoardId = null;
+            }
+            renderBoardTabs();
+            if (message.sourceId === state.clientId) {
+                showToast("共享板已重命名。");
+            }
+            return;
+        }
+        if (message.type === "board_deleted") {
+            handleBoardDeleted(message);
+            return;
+        }
+        if (message.type === "direct_status") {
+            state.direct.serverStatus = message.direct || { active: false };
+            if (
+                state.direct.active &&
+                !state.direct.serverStatus.active
+            ) {
+                resetDirectState();
+            }
+            renderDirectStatus();
+            return;
+        }
+        if (message.type === "direct_started") {
+            state.direct.starting = false;
+            state.direct.active = true;
+            state.direct.sessionId = message.sessionId;
+            state.direct.sequence = 0;
+            state.direct.acknowledgedText = "";
+            state.direct.pending = null;
+            state.direct.serverStatus = { active: true };
+            renderDirectStatus();
+            if (directCapture.value) {
+                scheduleDirectFlush(20);
+            }
+            return;
+        }
+        if (message.type === "direct_stopped") {
+            state.direct.serverStatus = { active: false };
+            resetDirectState();
+            return;
+        }
+        if (message.type === "direct_ack") {
+            handleDirectAcknowledgement(message);
+            return;
+        }
+        if (message.type === "direct_key_ack") {
+            handleDirectKeyAcknowledgement(message);
+            return;
+        }
+        if (message.type === "error") {
+            handleSocketError(message);
         }
     }
 
     function connect() {
         clearTimeout(state.reconnectTimer);
-        const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-        const socket = new WebSocket(`${protocol}//${location.host}/ws`);
-        state.socket = socket;
         setConnection("connecting", "未连接");
+        const scheme = location.protocol === "https:" ? "wss" : "ws";
+        const socket = new WebSocket(`${scheme}://${location.host}/ws`);
+        state.socket = socket;
 
         socket.addEventListener("open", () => {
             state.reconnectAttempt = 0;
             setConnection("online", "已连接");
         });
-        socket.addEventListener("message", handleSocketMessage);
+
+        socket.addEventListener("message", (event) => {
+            try {
+                handleMessage(JSON.parse(event.data));
+            } catch (_error) {
+                showToast("收到无法识别的同步消息。", true);
+            }
+        });
+
         socket.addEventListener("close", (event) => {
             if (state.socket !== socket) {
                 return;
             }
-            if (state.inFlight) {
-                saveDraft(state.inFlight.text, state.inFlight.baseRevision);
-                state.inFlight = null;
-            }
             setConnection("offline", "未连接");
-            setSync(input.value === state.serverText ? "等待重连" : "离线修改待发送");
-            if (state.manuallyClosed) {
-                return;
+            resetDirectState();
+            for (const [boardId, documentState] of state.documents) {
+                documentState.inFlight = null;
+                if (
+                    documentState.initialized &&
+                    documentState.localText !== documentState.serverText
+                ) {
+                    saveDraft(
+                        boardId,
+                        documentState.localText,
+                        documentState.revision,
+                    );
+                }
             }
+            updateSyncFromDocument(activeDocument());
             if (event.code === 1008) {
-                location.assign("/pair");
+                setTimeout(() => location.assign("/pair"), 500);
                 return;
             }
-            const delay = Math.min(5000, 500 * (2 ** state.reconnectAttempt));
-            state.reconnectAttempt += 1;
-            state.reconnectTimer = setTimeout(connect, delay);
-        });
-        socket.addEventListener("error", () => {
-            socket.close();
+            if (!state.manuallyClosed) {
+                const delay = Math.min(
+                    10000,
+                    700 * (2 ** state.reconnectAttempt),
+                );
+                state.reconnectAttempt += 1;
+                state.reconnectTimer = setTimeout(connect, delay);
+            }
         });
     }
 
@@ -400,7 +1313,6 @@
         const selectionStart = input.selectionStart;
         const selectionEnd = input.selectionEnd;
         const selectionDirection = input.selectionDirection;
-
         input.focus({ preventScroll: true });
         input.select();
         const copied = document.execCommand("copy");
@@ -425,13 +1337,29 @@
                 return;
             }
         } catch (_error) {
-            // Show the manual-copy guidance below.
+            // Show manual-copy guidance below.
         }
         throw new Error("当前浏览器未允许自动复制，请长按文本手动复制。");
     }
 
     async function pasteIntoComputer() {
         const response = await fetch("/api/actions/paste", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ boardId: state.activeBoardId }),
+        });
+        if (response.status === 401) {
+            location.assign("/pair");
+            return;
+        }
+        const payload = await response.json();
+        if (!response.ok) {
+            throw new Error(payload.error?.message ?? "插入到电脑当前窗口失败。");
+        }
+    }
+
+    async function sendEnterToComputer() {
+        const response = await fetch("/api/actions/enter", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: "{}",
@@ -442,7 +1370,7 @@
         }
         const payload = await response.json();
         if (!response.ok) {
-            throw new Error(payload.error?.message ?? "插入到电脑当前窗口失败。");
+            throw new Error(payload.error?.message ?? "发送电脑回车失败。");
         }
     }
 
@@ -465,6 +1393,8 @@
 
     function setAboutOpen(open) {
         aboutPanel.hidden = !open;
+        aboutBackdrop.hidden = !open;
+        document.body.classList.toggle("about-open", open);
         aboutButton.setAttribute("aria-expanded", String(open));
         if (open && accessSettingsPanel) {
             accessSettingsPanel.hidden = true;
@@ -476,22 +1406,30 @@
         accessSettingsPanel.hidden = !open;
         accessSettingsButton.setAttribute("aria-expanded", String(open));
         if (open) {
-            aboutPanel.hidden = true;
-            aboutButton.setAttribute("aria-expanded", "false");
+            setAboutOpen(false);
         }
     }
 
     input.addEventListener("input", () => {
+        const documentState = activeDocument();
+        if (!documentState) {
+            return;
+        }
+        documentState.localText = input.value;
         updateMeta();
         notifyWhenLimitIsReached();
-        saveDraft(input.value, state.revision);
-        if (state.conflict) {
-            state.conflict.localText = input.value;
+        saveDraft(
+            state.activeBoardId,
+            documentState.localText,
+            documentState.revision,
+        );
+        if (documentState.conflict) {
+            documentState.conflict.localText = documentState.localText;
             setSync("冲突期间的本机修改已暂存");
             return;
         }
-        setSync(state.socket?.readyState === WebSocket.OPEN ? "等待同步" : "离线修改待发送");
-        scheduleFlush();
+        updateSyncFromDocument(documentState);
+        scheduleFlush(state.activeBoardId);
     });
 
     useRemoteButton.addEventListener("click", resolveWithRemote);
@@ -499,8 +1437,34 @@
     aboutButton.addEventListener("click", () => {
         setAboutOpen(aboutPanel.hidden);
     });
-    closeAboutButton.addEventListener("click", () => {
-        setAboutOpen(false);
+    closeAboutButton.addEventListener("click", () => setAboutOpen(false));
+    aboutBackdrop.addEventListener("click", () => setAboutOpen(false));
+    document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && !aboutPanel.hidden) {
+            setAboutOpen(false);
+        }
+    });
+    boardModeButton.addEventListener("click", () => requestWorkMode("board"));
+    directModeButton.addEventListener("click", () => requestWorkMode("direct"));
+    addBoardButton.addEventListener("click", () => {
+        if (state.boards.size >= state.maxBoards) {
+            showToast(`最多只能创建 ${state.maxBoards} 个共享板。`, true);
+            return;
+        }
+        if (!send({ type: "create_board", clientId: state.clientId })) {
+            showToast("连接恢复后才能新建共享板。", true);
+        }
+    });
+    renameBoardButton.addEventListener("click", () => {
+        requestRenameBoard(state.activeBoardId);
+    });
+    renameBoardForm.addEventListener("submit", (event) => {
+        event.preventDefault();
+        submitBoardRename();
+    });
+    cancelRenameBoardButton.addEventListener("click", closeRenameBoardDialog);
+    renameBoardDialog.addEventListener("cancel", () => {
+        state.renameDialogBoardId = null;
     });
 
     if (accessSettingsButton) {
@@ -551,14 +1515,27 @@
         });
     }
 
-    copyButton.addEventListener("click", async () => {
-        try {
-            await copyToCurrentDevice();
-            showToast("已复制到当前设备剪贴板。");
-        } catch (error) {
-            showToast(error.message, true);
-        }
-    });
+    if (copyButton) {
+        copyButton.addEventListener("click", async () => {
+            try {
+                await copyToCurrentDevice();
+                showToast("已复制到当前设备剪贴板。");
+            } catch (error) {
+                showToast(error.message, true);
+            }
+        });
+    }
+
+    if (remoteEnterButton) {
+        remoteEnterButton.addEventListener("click", async () => {
+            try {
+                await sendEnterToComputer();
+                showToast("已发送电脑回车。");
+            } catch (error) {
+                showToast(error.message, true);
+            }
+        });
+    }
 
     if (pasteButton) {
         pasteButton.addEventListener("click", async () => {
@@ -572,7 +1549,7 @@
     }
 
     clearButton.addEventListener("click", () => {
-        if (!input.value || !confirm("确定清空所有设备上的共享文本吗？")) {
+        if (!input.value || !confirm("确定清空当前共享板吗？")) {
             return;
         }
         input.value = "";
@@ -580,14 +1557,80 @@
         input.focus();
     });
 
+    if (directCapture) {
+        directCapture.addEventListener("input", () => {
+            renderDirectStatus();
+            if (state.direct.active && !state.direct.composing) {
+                scheduleDirectFlush();
+            }
+        });
+        directCapture.addEventListener("compositionstart", () => {
+            state.direct.composing = true;
+            renderDirectStatus();
+        });
+        directCapture.addEventListener("compositionend", () => {
+            state.direct.composing = false;
+            renderDirectStatus();
+            if (state.direct.active) {
+                scheduleDirectFlush(25);
+            }
+        });
+    }
+
+    if (directToggleButton) {
+        directToggleButton.addEventListener("pointerdown", (event) => {
+            event.preventDefault();
+        });
+        directToggleButton.addEventListener("click", () => {
+            if (state.direct.active || state.direct.starting) {
+                stopDirect();
+                return;
+            }
+            focusElement(directCapture);
+            startDirect();
+        });
+    }
+
+    input.addEventListener("pointerdown", reactivateEmptySharedInput);
+    editorCard.addEventListener("click", (event) => {
+        if (event.target === editorCard) {
+            focusSharedInput();
+        }
+    });
+
+    for (const [button, key] of [
+        [directBackspaceButton, "backspace"],
+        [directEnterButton, "enter"],
+    ]) {
+        if (!button) {
+            continue;
+        }
+        button.addEventListener("pointerdown", (event) => {
+            event.preventDefault();
+        });
+        button.addEventListener("click", () => {
+            void triggerDirectKey(key);
+        });
+    }
+
     window.addEventListener("pagehide", () => {
         state.manuallyClosed = true;
-        if (input.value !== state.serverText) {
-            saveDraft(input.value, state.revision);
+        for (const [boardId, documentState] of state.documents) {
+            if (
+                documentState.initialized &&
+                documentState.localText !== documentState.serverText
+            ) {
+                saveDraft(
+                    boardId,
+                    documentState.localText,
+                    documentState.revision,
+                );
+            }
         }
         state.socket?.close();
     });
 
+    applyWorkMode(state.workMode);
     setConnection("connecting", "未连接");
     updateMeta();
     connect();

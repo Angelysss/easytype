@@ -8,12 +8,16 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
 </head>
 <body>
-    <main class="shell editor-shell">
+    <main
+        class="shell editor-shell"
+        data-is-local="{{ 'true' if is_local else 'false' }}"
+        data-max-boards="{{ max_boards }}"
+    >
         <header class="topbar">
             <div class="topbar-title-row">
                 <div>
                     <p class="eyebrow">EASYTYPE</p>
-                    <h1>共享文本板</h1>
+                    <h1>EasyType</h1>
                 </div>
                 <div id="connectionBadge" class="status-badge status-connecting" aria-live="polite">
                     <span class="status-dot"></span>
@@ -52,27 +56,35 @@
             </div>
         </header>
 
-        <section id="aboutPanel" class="panel about-panel" hidden>
+        <div id="aboutBackdrop" class="about-backdrop" hidden></div>
+        <section
+            id="aboutPanel"
+            class="panel about-panel"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="aboutTitle"
+            hidden
+        >
             <div class="section-heading">
                 <div>
-                    <h2>关于 EasyType</h2>
+                    <h2 id="aboutTitle">关于 EasyType</h2>
                     <p>用于家庭局域网内手机与电脑之间共享文本。</p>
                 </div>
-                <button id="closeAboutButton" class="button ghost compact-button" type="button">
-                    关闭
-                </button>
-            </div>
-            <div class="about-details">
-                <div class="about-item">
-                    <strong>项目地址</strong>
+                <div class="about-heading-actions">
                     <a
+                        class="button secondary compact-button about-github-link"
                         href="https://github.com/Angelysss/easytype"
                         target="_blank"
                         rel="noopener noreferrer"
                     >
-                        github.com/Angelysss/easytype
+                        GitHub
                     </a>
+                    <button id="closeAboutButton" class="button ghost compact-button" type="button">
+                        关闭
+                    </button>
                 </div>
+            </div>
+            <div class="about-details">
                 <div class="about-item">
                     <strong>手机端“插入”的作用</strong>
                     <p>
@@ -80,8 +92,54 @@
                         电脑会把共享文本粘贴到当前获得焦点的输入框中。
                     </p>
                 </div>
+                <div class="about-item">
+                    <strong>直输模式</strong>
+                    <p>
+                        手机语音或键盘输入会实时模拟到 Windows 当前窗口，
+                        不使用电脑剪贴板。未开启直输时，退格和回车也能
+                        直接操作电脑当前窗口。
+                    </p>
+                </div>
+                <div class="about-item">
+                    <strong>多个共享板</strong>
+                    <p>
+                        最多保存 {{ max_boards }} 个共享板。每台设备可以独立选择，
+                        所有共享板由电脑保存并同步。
+                    </p>
+                </div>
             </div>
         </section>
+
+        <dialog
+            id="renameBoardDialog"
+            class="rename-board-dialog"
+            aria-labelledby="renameBoardTitle"
+        >
+            <form id="renameBoardForm" class="rename-board-form">
+                <div>
+                    <h2 id="renameBoardTitle">重命名共享板</h2>
+                    <p>输入一个容易识别的名称，最多 24 个字符。</p>
+                </div>
+                <label for="renameBoardInput">共享板名称</label>
+                <input
+                    id="renameBoardInput"
+                    type="text"
+                    maxlength="24"
+                    autocomplete="off"
+                    required
+                >
+                <div class="button-row compact">
+                    <button
+                        id="cancelRenameBoardButton"
+                        class="button ghost"
+                        type="button"
+                    >
+                        取消
+                    </button>
+                    <button class="button primary" type="submit">保存</button>
+                </div>
+            </form>
+        </dialog>
 
         {% if is_local %}
         <section id="accessSettingsPanel" class="panel access-settings-panel" hidden>
@@ -152,61 +210,207 @@
         </section>
         {% endif %}
 
-        <section id="conflictPanel" class="conflict-panel" hidden aria-live="assertive">
-            <div>
-                <strong>另一台设备也修改了内容</strong>
-                <p>为避免覆盖，自动同步已暂停。请选择保留哪一份。</p>
-            </div>
-            <div class="button-row compact">
-                <button id="useRemoteButton" class="button secondary" type="button">采用最新内容</button>
-                <button id="keepLocalButton" class="button danger" type="button">用本机内容覆盖</button>
-            </div>
+        <nav class="work-mode-switch" aria-label="工作模式">
+            <button
+                id="boardModeButton"
+                class="work-mode-button"
+                type="button"
+                data-mode="board"
+                aria-pressed="true"
+            >
+                共享板
+            </button>
+            <button
+                id="directModeButton"
+                class="work-mode-button"
+                type="button"
+                data-mode="direct"
+                aria-pressed="false"
+            >
+                直输
+            </button>
+        </nav>
+
+        <section id="boardWorkspace">
+            <nav class="board-switcher" aria-label="共享板">
+                <div id="boardTabs" class="board-tabs"></div>
+                <div class="board-management-buttons">
+                    <button
+                        id="addBoardButton"
+                        class="board-add-button"
+                        type="button"
+                        title="新建共享板"
+                        aria-label="新建共享板"
+                    >
+                        ＋
+                    </button>
+                    <button
+                        id="renameBoardButton"
+                        class="board-rename-button"
+                        type="button"
+                        title="重命名当前共享板"
+                        aria-label="重命名当前共享板"
+                    >
+                        ✎
+                    </button>
+                </div>
+            </nav>
+
+            <section id="conflictPanel" class="conflict-panel" hidden aria-live="assertive">
+                <div>
+                    <strong>另一台设备也修改了当前共享板</strong>
+                    <p>为避免覆盖，自动同步已暂停。请选择保留哪一份。</p>
+                </div>
+                <div class="button-row compact">
+                    <button id="useRemoteButton" class="button secondary" type="button">采用最新内容</button>
+                    <button id="keepLocalButton" class="button danger" type="button">用本机内容覆盖</button>
+                </div>
+            </section>
+
+            <section class="editor-card">
+                <label class="sr-only" for="sharedText">共享文本</label>
+                <textarea
+                    id="sharedText"
+                    maxlength="{{ max_text_bytes }}"
+                    placeholder="在手机或电脑上输入，另一端会自动同步……"
+                    spellcheck="false"
+                    autocomplete="off"
+                ></textarea>
+                <footer class="editor-toolbar">
+                    <div class="editor-meta">
+                        <span id="charCount">0 字符</span>
+                        <span class="editor-meta-separator" aria-hidden="true">|</span>
+                        <span id="syncState" title="等待连接">等待连接</span>
+                    </div>
+                    <div class="editor-action-buttons{% if not is_local %} remote-actions{% endif %}">
+                        {% if is_local %}
+                        <button
+                            id="copyButton"
+                            class="button secondary"
+                            type="button"
+                            title="复制到当前设备剪贴板"
+                        >
+                            复制
+                        </button>
+                        {% else %}
+                        <button
+                            id="pasteButton"
+                            class="button primary"
+                            type="button"
+                            title="插入到电脑当前窗口"
+                        >
+                            插入
+                        </button>
+                        <button
+                            id="remoteEnterButton"
+                            class="button secondary"
+                            type="button"
+                            title="发送电脑回车"
+                        >
+                            回车
+                        </button>
+                        <button
+                            id="clearButton"
+                            class="button ghost"
+                            type="button"
+                            title="清空当前共享板"
+                        >
+                            清空
+                        </button>
+                        {% endif %}
+                        {% if is_local %}
+                        <button
+                            id="clearButton"
+                            class="button ghost"
+                            type="button"
+                            title="清空当前共享板"
+                        >
+                            清空
+                        </button>
+                        {% endif %}
+                    </div>
+                </footer>
+            </section>
         </section>
 
-        <section class="editor-card">
-            <label class="sr-only" for="sharedText">共享文本</label>
-            <textarea
-                id="sharedText"
-                maxlength="{{ max_text_bytes }}"
-                placeholder="在手机或电脑上输入，另一端会自动同步……"
-                spellcheck="false"
-                autocomplete="off"
-            ></textarea>
-            <footer class="editor-toolbar">
-                <div class="editor-meta">
-                    <span id="charCount">0 字符</span>
-                    <span class="editor-meta-separator" aria-hidden="true">|</span>
-                    <span id="syncState" title="等待连接">等待连接</span>
+        <section
+            id="directWorkspace"
+            class="direct-workspace"
+            hidden
+        >
+            <div
+                id="directSurface"
+                class="direct-surface{% if is_local %} direct-local-only{% endif %}"
+            >
+                {% if not is_local %}
+                <textarea
+                    id="directCapture"
+                    class="direct-capture"
+                    aria-label="点击开启直输并调出手机输入法"
+                    autocomplete="off"
+                    autocapitalize="sentences"
+                    spellcheck="false"
+                    inputmode="text"
+                ></textarea>
+                {% endif %}
+                {% if not is_local %}
+                <button
+                    id="directToggleButton"
+                    class="direct-wave"
+                    type="button"
+                    aria-label="开启直输"
+                    aria-pressed="false"
+                >
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                </button>
+                {% else %}
+                <div id="directWave" class="direct-wave" aria-hidden="true">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                    <span></span>
                 </div>
-                <div class="editor-action-buttons{% if not is_local %} remote-actions{% endif %}">
+                {% endif %}
+                {% if not is_local %}
+                <div class="direct-key-row" aria-label="电脑键盘快捷键">
                     <button
-                        id="copyButton"
-                        class="button secondary"
+                        id="directBackspaceButton"
+                        class="direct-key-button"
                         type="button"
-                        title="复制到当前设备剪贴板"
+                        disabled
                     >
-                        复制
+                        <span aria-hidden="true">⌫</span>
+                        退格
                     </button>
-                    {% if not is_local %}
                     <button
-                        id="pasteButton"
-                        class="button primary"
+                        id="directEnterButton"
+                        class="direct-key-button primary-key"
                         type="button"
-                        title="插入到电脑当前窗口"
+                        disabled
                     >
-                        插入
-                    </button>
-                    {% endif %}
-                    <button
-                        id="clearButton"
-                        class="button ghost"
-                        type="button"
-                        title="清空共享文本"
-                    >
-                        清空
+                        <span aria-hidden="true">↵</span>
+                        回车
                     </button>
                 </div>
-            </footer>
+                {% endif %}
+                <div class="direct-copy">
+                    <strong id="directStatus">
+                        {{ "请在手机上开启直输" if is_local else "点击波浪开启直输" }}
+                    </strong>
+                    <span id="directHint">
+                        {{ "电脑会显示当前直输状态" if is_local else "开启后可使用手机语音输入" }}
+                    </span>
+                </div>
+            </div>
         </section>
 
         <footer class="page-footer">

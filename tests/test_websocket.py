@@ -30,12 +30,21 @@ def test_two_clients_sync_and_stale_update_conflicts(tmp_path):
     try:
         first = websocket.create_connection(url, timeout=3)
         second = websocket.create_connection(url, timeout=3)
-        assert receive_type(first, "snapshot")["document"]["revision"] == 0
-        assert receive_type(second, "snapshot")["document"]["revision"] == 0
+        first_snapshot = receive_type(first, "snapshot")
+        second_snapshot = receive_type(second, "snapshot")
+        assert first_snapshot["document"]["revision"] == 0
+        assert second_snapshot["document"]["revision"] == 0
+        assert [board["name"] for board in first_snapshot["boards"]] == [
+            "板 1",
+            "板 2",
+            "板 3",
+        ]
+        assert "workMode" not in first_snapshot
 
         first.send(json.dumps({
             "type": "update",
             "clientId": "computer",
+            "boardId": "board-1",
             "baseRevision": 0,
             "text": "电脑输入的第一版",
         }))
@@ -48,6 +57,7 @@ def test_two_clients_sync_and_stale_update_conflicts(tmp_path):
         second.send(json.dumps({
             "type": "update",
             "clientId": "phone",
+            "boardId": "board-1",
             "baseRevision": 0,
             "text": "手机基于过期版本输入",
         }))
@@ -55,7 +65,49 @@ def test_two_clients_sync_and_stale_update_conflicts(tmp_path):
 
         assert conflict["document"]["revision"] == 1
         assert conflict["document"]["text"] == "电脑输入的第一版"
-        assert app.extensions["easytype_document"].snapshot()["text"] == "电脑输入的第一版"
+        assert app.extensions["easytype_boards"].snapshot("board-1")["text"] == (
+            "电脑输入的第一版"
+        )
+
+        first.send(json.dumps({
+            "type": "create_board",
+            "clientId": "computer",
+        }))
+        created = receive_type(first, "board_created")
+        assert created["board"]["name"] == "板 4"
+        board_four_id = created["board"]["id"]
+        assert board_four_id.startswith("board-4-")
+        assert receive_type(second, "board_created")["board"]["id"] == board_four_id
+
+        first.send(json.dumps({
+            "type": "rename_board",
+            "boardId": board_four_id,
+            "name": "语音草稿",
+            "clientId": "computer",
+        }))
+        first_renamed = receive_type(first, "board_renamed")
+        second_renamed = receive_type(second, "board_renamed")
+        assert first_renamed["board"]["name"] == "语音草稿"
+        assert first_renamed["sourceId"] == "computer"
+        assert second_renamed["board"]["id"] == board_four_id
+
+        second.send(json.dumps({
+            "type": "select_board",
+            "boardId": board_four_id,
+        }))
+        selected = receive_type(second, "board_snapshot")
+        assert selected["document"]["id"] == board_four_id
+
+        first.send(json.dumps({
+            "type": "delete_board",
+            "boardId": board_four_id,
+            "clientId": "computer",
+        }))
+        first_deleted = receive_type(first, "board_deleted")
+        second_deleted = receive_type(second, "board_deleted")
+        assert first_deleted["boardId"] == board_four_id
+        assert first_deleted["fallback"]["name"] == "板 3"
+        assert second_deleted["fallback"]["id"] == first_deleted["fallback"]["id"]
     finally:
         for connection in (first, second):
             if connection is not None:

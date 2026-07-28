@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes
+import json
 import logging
 import os
+import subprocess
+import sys
 import threading
 import webbrowser
 from pathlib import Path
 
 from werkzeug.serving import make_server
 
-from easytype_app import create_app
+from easytype_app import create_app, default_data_dir
 
 try:
     import pystray
@@ -22,6 +26,7 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+FIREWALL_MARKER_NAME = "firewall.json"
 
 
 def configured_port() -> int:
@@ -40,6 +45,152 @@ def show_message(title: str, text: str) -> None:
         ctypes.windll.user32.MessageBoxW(0, text, title, 0x40)
     except Exception:
         logger.warning("%s: %s", title, text)
+
+
+def _firewall_marker_matches(
+    marker_path: Path,
+    executable: Path,
+    port: int,
+) -> bool:
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    return marker == {
+        "version": 1,
+        "executable": str(executable),
+        "port": port,
+    }
+
+
+def _write_firewall_marker(
+    marker_path: Path,
+    executable: Path,
+    port: int,
+) -> None:
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = marker_path.with_suffix(".tmp")
+    temporary_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "executable": str(executable),
+                "port": port,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    os.replace(temporary_path, marker_path)
+
+
+def ensure_windows_firewall_access(
+    port: int,
+    data_dir: Path | None = None,
+    *,
+    host: str = "0.0.0.0",
+) -> bool:
+    """Configure one private-LAN rule for a packaged EasyType executable."""
+    if (
+        os.name != "nt"
+        or not getattr(sys, "frozen", False)
+        or host in {"127.0.0.1", "::1", "localhost"}
+    ):
+        return True
+
+    executable = Path(sys.executable).resolve()
+    resolved_data_dir = Path(data_dir) if data_dir is not None else default_data_dir()
+    marker_path = resolved_data_dir / FIREWALL_MARKER_NAME
+    if _firewall_marker_matches(marker_path, executable, port):
+        return True
+
+    escaped_executable = str(executable).replace("'", "''")
+    elevated_script = f"""
+$ErrorActionPreference = 'Stop'
+$easyTypeExecutable = '{escaped_executable}'
+$easyTypePort = {port}
+$displayName = "EasyType LAN TCP $easyTypePort"
+
+Get-NetFirewallRule -Direction Inbound -Action Block -ErrorAction SilentlyContinue |
+    ForEach-Object {{
+        $application = Get-NetFirewallApplicationFilter `
+            -AssociatedNetFirewallRule $_ `
+            -ErrorAction SilentlyContinue
+        if (
+            $application.Program -and
+            [string]::Equals(
+                $application.Program,
+                $easyTypeExecutable,
+                [StringComparison]::OrdinalIgnoreCase
+            )
+        ) {{
+            Remove-NetFirewallRule -Name $_.Name -ErrorAction SilentlyContinue
+        }}
+    }}
+
+Get-NetFirewallRule -Group 'EasyType' -ErrorAction SilentlyContinue |
+    Remove-NetFirewallRule -ErrorAction SilentlyContinue
+Get-NetFirewallRule -DisplayName 'EasyType LAN TCP *' -ErrorAction SilentlyContinue |
+    Remove-NetFirewallRule -ErrorAction SilentlyContinue
+
+New-NetFirewallRule `
+    -DisplayName $displayName `
+    -Group 'EasyType' `
+    -Direction Inbound `
+    -Action Allow `
+    -Protocol TCP `
+    -LocalPort $easyTypePort `
+    -Profile Private `
+    -RemoteAddress LocalSubnet `
+    -Program $easyTypeExecutable | Out-Null
+"""
+    encoded_script = base64.b64encode(
+        elevated_script.encode("utf-16-le")
+    ).decode("ascii")
+    windows_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    powershell = (
+        windows_root
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    launcher_script = (
+        "$ErrorActionPreference='Stop';"
+        f"$arguments='-NoProfile -NonInteractive -ExecutionPolicy Bypass "
+        f"-EncodedCommand {encoded_script}';"
+        f"$process=Start-Process -FilePath '{str(powershell).replace("'", "''")}' "
+        "-ArgumentList $arguments -Verb RunAs -Wait -PassThru;"
+        "exit $process.ExitCode"
+    )
+    try:
+        completed = subprocess.run(
+            [
+                str(powershell),
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                launcher_script,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if completed.returncode != 0:
+        return False
+
+    try:
+        _write_firewall_marker(marker_path, executable, port)
+    except OSError:
+        logger.warning("Firewall access was configured, but its marker could not be saved.")
+    return True
 
 
 class EasyTypeServer(threading.Thread):
@@ -137,6 +288,17 @@ def main() -> None:
     except ValueError as error:
         show_message("EasyType", str(error))
         return
+    if not ensure_windows_firewall_access(
+        port,
+        args.data_dir,
+        host=args.host,
+    ):
+        show_message(
+            "EasyType 网络访问",
+            "EasyType 需要一次 Windows 管理员确认，才能让同一 Wi-Fi 下的"
+            "手机访问。\n\n当前未完成授权，本机网页仍可使用；重新启动 "
+            "EasyType 后可以再次授权。",
+        )
     if args.no_tray:
         create_app(port=port, data_dir=args.data_dir).run(
             host=args.host,
