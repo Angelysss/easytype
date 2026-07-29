@@ -52,6 +52,17 @@ def test_firewall_configuration_supports_source_and_all_network_profiles(
 ):
     calls = []
     monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "executable",
+        r"C:\EasyType\.venv\Scripts\python.exe",
+    )
+    monkeypatch.setattr(
+        sys,
+        "_base_executable",
+        r"C:\Python\python.exe",
+        raising=False,
+    )
     monkeypatch.setattr(main.os, "name", "nt")
     monkeypatch.setenv("SystemRoot", r"C:\Windows")
     monkeypatch.setattr(
@@ -73,12 +84,16 @@ def test_firewall_configuration_supports_source_and_all_network_profiles(
     assert "-RemoteAddress LocalSubnet" in firewall_script
     assert "-LocalPort $easyTypePort" in firewall_script
     assert "-Program" not in firewall_script
+    assert r"C:\EasyType\.venv\Scripts\python.exe" in firewall_script
+    assert r"C:\Python\python.exe" in firewall_script
+    assert "-Action Block" in firewall_script
+    assert "Remove-NetFirewallRule -Name $blockRule.Name" in firewall_script
 
 
 def test_firewall_configuration_runs_once(monkeypatch, tmp_path):
     calls = []
     (tmp_path / main.FIREWALL_MARKER_NAME).write_text(
-        '{"version":1,"executable":"old.exe","port":5000}',
+        '{"version":2,"port":5000}',
         encoding="utf-8",
     )
 
@@ -102,6 +117,31 @@ def test_firewall_configuration_runs_once(monkeypatch, tmp_path):
         "version": main.FIREWALL_MARKER_VERSION,
         "port": 5000,
     }
+
+
+def test_firewall_configuration_can_be_forced(monkeypatch, tmp_path):
+    calls = []
+    (tmp_path / main.FIREWALL_MARKER_NAME).write_text(
+        f'{{"version":{main.FIREWALL_MARKER_VERSION},"port":5000}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main.os, "name", "nt")
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    monkeypatch.setattr(
+        main.subprocess,
+        "run",
+        lambda arguments, **options: (
+            calls.append((arguments, options))
+            or SimpleNamespace(returncode=0)
+        ),
+    )
+
+    assert main.ensure_windows_firewall_access(
+        5000,
+        tmp_path,
+        force=True,
+    ) is True
+    assert len(calls) == 1
 
 
 def test_firewall_configuration_can_be_declined(monkeypatch, tmp_path):

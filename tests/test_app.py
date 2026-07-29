@@ -103,7 +103,10 @@ def test_local_editor_and_info_are_available(client, monkeypatch):
     assert 'id="directToggleButton"' not in page_text
     assert 'id="directBackspaceButton"' not in page_text
     assert 'id="directEnterButton"' not in page_text
-    assert "EasyType v1.1.1" in page_text
+    assert 'id="markdownAssistToggle"' in page_text
+    assert 'role="switch"' in page_text
+    assert "保持纯文本，不进行渲染" in page_text
+    assert "EasyType v1.2.0" in page_text
     assert "http://192.168.1.10:5000" in page_text
     assert re.search(r'id="copyButton"[^>]*>\s*复制\s*</button>', page_text)
     assert 'id="remoteEnterButton"' not in page_text
@@ -117,7 +120,7 @@ def test_local_editor_and_info_are_available(client, monkeypatch):
     assert 'class="action-card"' not in page_text
     assert 'class="editor-action-note"' not in page_text
     assert info.status_code == 200
-    assert info.get_json()["version"] == "1.1.1"
+    assert info.get_json()["version"] == "1.2.0"
     assert info.get_json()["revision"] == 0
     assert info.get_json()["boardCount"] == 3
     assert info.get_json()["maxBoards"] == 8
@@ -140,6 +143,13 @@ def test_static_assets_have_browser_executable_mime_types(client):
     assert javascript.headers["X-Content-Type-Options"] == "nosniff"
     assert 'document.execCommand("copy")' in editor_javascript.get_data(as_text=True)
     assert "navigator.clipboard?.writeText" in editor_javascript.get_data(as_text=True)
+    assert 'socket.send(\'{"type":"ping"}\')' in editor_javascript.get_data(as_text=True)
+    assert 'document.addEventListener("visibilitychange"' in (
+        editor_javascript.get_data(as_text=True)
+    )
+    assert 'window.addEventListener("pageshow"' in editor_javascript.get_data(
+        as_text=True
+    )
     assert stylesheet.status_code == 200
     assert stylesheet.mimetype == "text/css"
 
@@ -158,6 +168,19 @@ def test_empty_shared_board_keeps_mobile_input_connection(client):
         r'input\.blur\(\);\s+input\.value = "";',
         editor_javascript,
     )
+
+
+def test_markdown_assist_is_local_plain_text_editor_behavior(client):
+    editor_javascript = client.get("/static/editor.js").get_data(as_text=True)
+
+    assert 'const MARKDOWN_ASSIST_KEY = "easytype.markdownAssist.v1"' in (
+        editor_javascript
+    )
+    assert "localStorage.setItem(" in editor_javascript
+    assert "function markdownLinePrefix(line)" in editor_javascript
+    assert "function markdownLineBreakEdit()" in editor_javascript
+    assert "input.setRangeText(edit.text" in editor_javascript
+    assert '"insertLineBreak", "insertParagraph"' in editor_javascript
 
 
 def test_remote_device_must_pair_and_pairing_is_single_use(app, client):
@@ -343,6 +366,55 @@ def test_access_mode_can_only_be_changed_locally_from_same_origin(client):
     assert remote.status_code == 403
     assert cross_origin.status_code == 403
     assert invalid.status_code == 400
+
+
+def test_network_access_repair_is_local_same_origin_only(tmp_path):
+    calls = []
+    app = create_app(
+        data_dir=tmp_path,
+        testing=True,
+        network_repair_callback=lambda: calls.append(True) or True,
+    )
+    client = app.test_client()
+
+    repaired = client.post(
+        "/api/admin/network-access/repair",
+        json={},
+        headers={"Origin": "http://localhost"},
+    )
+    remote = client.post(
+        "/api/admin/network-access/repair",
+        json={},
+        headers={"Origin": "http://192.168.1.10:5000"},
+        environ_overrides=remote_environ(),
+    )
+    cross_origin = client.post(
+        "/api/admin/network-access/repair",
+        json={},
+        headers={"Origin": "http://evil.example"},
+    )
+
+    assert repaired.status_code == 200
+    assert repaired.get_json()["ok"] is True
+    assert calls == [True]
+    assert remote.status_code == 403
+    assert cross_origin.status_code == 403
+
+
+def test_network_access_repair_reports_declined_authorization(tmp_path):
+    app = create_app(
+        data_dir=tmp_path,
+        testing=True,
+        network_repair_callback=lambda: False,
+    )
+    response = app.test_client().post(
+        "/api/admin/network-access/repair",
+        json={},
+        headers={"Origin": "http://localhost"},
+    )
+
+    assert response.status_code == 500
+    assert response.get_json()["error"]["code"] == "network_repair_failed"
 
 
 def test_trusted_lan_mode_shows_one_phone_address_and_qr(client, monkeypatch):
