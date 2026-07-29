@@ -103,7 +103,7 @@ def test_local_editor_and_info_are_available(client, monkeypatch):
     assert 'id="directToggleButton"' not in page_text
     assert 'id="directBackspaceButton"' not in page_text
     assert 'id="directEnterButton"' not in page_text
-    assert "EasyType v1.1.0" in page_text
+    assert "EasyType v1.1.1" in page_text
     assert "http://192.168.1.10:5000" in page_text
     assert re.search(r'id="copyButton"[^>]*>\s*复制\s*</button>', page_text)
     assert 'id="remoteEnterButton"' not in page_text
@@ -117,7 +117,7 @@ def test_local_editor_and_info_are_available(client, monkeypatch):
     assert 'class="action-card"' not in page_text
     assert 'class="editor-action-note"' not in page_text
     assert info.status_code == 200
-    assert info.get_json()["version"] == "1.1.0"
+    assert info.get_json()["version"] == "1.1.1"
     assert info.get_json()["revision"] == 0
     assert info.get_json()["boardCount"] == 3
     assert info.get_json()["maxBoards"] == 8
@@ -142,6 +142,22 @@ def test_static_assets_have_browser_executable_mime_types(client):
     assert "navigator.clipboard?.writeText" in editor_javascript.get_data(as_text=True)
     assert stylesheet.status_code == 200
     assert stylesheet.mimetype == "text/css"
+
+
+def test_empty_shared_board_keeps_mobile_input_connection(client):
+    editor_javascript = client.get("/static/editor.js").get_data(as_text=True)
+
+    assert 'const EMPTY_INPUT_SENTINEL = "\\u200b"' in editor_javascript
+    assert 'input.addEventListener("focus", keepEmptySharedInputEditable)' in (
+        editor_javascript
+    )
+    assert "documentState.localText = sharedTextValue()" in editor_javascript
+    assert "pendingBoardFocusId" not in editor_javascript
+    assert "focusEditor" not in editor_javascript
+    assert re.search(
+        r'input\.blur\(\);\s+input\.value = "";',
+        editor_javascript,
+    )
 
 
 def test_remote_device_must_pair_and_pairing_is_single_use(app, client):

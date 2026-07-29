@@ -34,7 +34,7 @@ from flask import (
 from flask_sock import Sock
 
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 COOKIE_NAME = "easytype_session"
 COOKIE_MAX_AGE_SECONDS = 180 * 24 * 60 * 60
 MAX_TEXT_BYTES = 1024 * 1024
