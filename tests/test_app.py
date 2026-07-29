@@ -154,7 +154,10 @@ def test_empty_shared_board_keeps_mobile_input_connection(client):
     assert "documentState.localText = sharedTextValue()" in editor_javascript
     assert "pendingBoardFocusId" not in editor_javascript
     assert "focusEditor" not in editor_javascript
-    assert 'input.blur();\n        input.value = "";' in editor_javascript
+    assert re.search(
+        r'input\.blur\(\);\s+input\.value = "";',
+        editor_javascript,
+    )
 
 
 def test_remote_device_must_pair_and_pairing_is_single_use(app, client):
