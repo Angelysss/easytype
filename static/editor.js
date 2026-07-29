@@ -7,6 +7,7 @@
     const ACTIVE_BOARD_KEY = "easytype.activeBoard.v1";
     const WORK_MODE_KEY = "easytype.workMode.v1";
     const DIRECT_FLUSH_DELAY_MS = 45;
+    const EMPTY_INPUT_SENTINEL = "\u200b";
     const textEncoder = new TextEncoder();
 
     const shell = document.querySelector(".editor-shell");
@@ -63,7 +64,6 @@
         activeBoardId: null,
         workMode: readWorkMode(),
         maxBoards: Number(shell.dataset.maxBoards) || 8,
-        pendingBoardFocusId: null,
         deletingBoardId: null,
         renamingBoardId: null,
         renameDialogBoardId: null,
@@ -245,9 +245,7 @@
                 "aria-selected",
                 String(board.id === state.activeBoardId),
             );
-            selectButton.addEventListener("click", () => selectBoard(board.id, {
-                focusEditor: true,
-            }));
+            selectButton.addEventListener("click", () => selectBoard(board.id));
 
             let cornerControl;
             if (board.unread) {
@@ -351,8 +349,29 @@
             : null;
     }
 
+    function sharedTextValue() {
+        return input.value.split(EMPTY_INPUT_SENTINEL).join("");
+    }
+
+    function keepEmptySharedInputEditable() {
+        if (
+            document.activeElement !== input ||
+            input.disabled ||
+            sharedTextValue()
+        ) {
+            return;
+        }
+        input.value = EMPTY_INPUT_SENTINEL;
+        input.setSelectionRange(1, 1);
+    }
+
+    function setSharedTextValue(text) {
+        input.value = text;
+        keepEmptySharedInputEditable();
+    }
+
     function updateMeta() {
-        charCount.textContent = `${input.value.length} 字符`;
+        charCount.textContent = `${sharedTextValue().length} 字符`;
     }
 
     function updateSyncFromDocument(documentState) {
@@ -384,7 +403,7 @@
         const selectionStart = input.selectionStart;
         const selectionEnd = input.selectionEnd;
         input.disabled = false;
-        input.value = documentState.localText;
+        setSharedTextValue(documentState.localText);
         if (preserveSelection && wasFocused) {
             focusElement(input);
             input.setSelectionRange(
@@ -414,30 +433,12 @@
             return false;
         }
         focusElement(input);
+        keepEmptySharedInputEditable();
         if (moveCursorToEnd) {
             const cursor = input.value.length;
             input.setSelectionRange(cursor, cursor);
         }
         return document.activeElement === input;
-    }
-
-    function reactivateEmptySharedInput() {
-        if (
-            input.value ||
-            input.disabled ||
-            state.workMode !== "board" ||
-            !activeDocument()?.initialized
-        ) {
-            return;
-        }
-        // Some mobile browsers keep an empty textarea as document.activeElement
-        // after hiding the keyboard. Refocusing inside the next user gesture
-        // makes the virtual keyboard available again.
-        if (document.activeElement === input) {
-            input.blur();
-        }
-        focusSharedInput({ moveCursorToEnd: false });
-        input.setSelectionRange(0, 0);
     }
 
     function applyBoardSnapshot(document) {
@@ -488,10 +489,6 @@
         updateBoardMetadata(document);
         if (document.id === state.activeBoardId) {
             renderActiveDocument({ preserveSelection: true });
-            if (state.pendingBoardFocusId === document.id) {
-                state.pendingBoardFocusId = null;
-                focusSharedInput();
-            }
         }
         renderBoardTabs();
         if (
@@ -502,13 +499,16 @@
         }
     }
 
-    function selectBoard(boardId, { focusEditor = false } = {}) {
+    function selectBoard(boardId) {
         if (!state.boards.has(boardId)) {
             return;
         }
+        if (boardId !== state.activeBoardId) {
+            input.blur();
+        }
         const current = activeDocument();
         if (current?.initialized) {
-            current.localText = input.value;
+            current.localText = sharedTextValue();
             if (current.localText !== current.serverText) {
                 saveDraft(
                     state.activeBoardId,
@@ -525,11 +525,6 @@
         board.unread = false;
         renderBoardTabs();
         renderActiveDocument();
-        if (focusEditor) {
-            if (!focusSharedInput()) {
-                state.pendingBoardFocusId = boardId;
-            }
-        }
         send({ type: "select_board", boardId });
     }
 
@@ -671,11 +666,9 @@
         }
 
         if (wasActive && message.fallback) {
+            input.blur();
             state.activeBoardId = message.fallback.id;
             localStorage.setItem(ACTIVE_BOARD_KEY, message.fallback.id);
-            state.pendingBoardFocusId = message.sourceId === state.clientId
-                ? message.fallback.id
-                : null;
             applyBoardSnapshot(message.fallback);
             send({
                 type: "select_board",
@@ -726,7 +719,7 @@
     }
 
     function notifyWhenLimitIsReached() {
-        const byteLength = textEncoder.encode(input.value).byteLength;
+        const byteLength = textEncoder.encode(sharedTextValue()).byteLength;
         if (byteLength < MAX_TEXT_BYTES) {
             state.limitNoticeShown = false;
             return;
@@ -743,7 +736,7 @@
         state.limitNoticeShown = true;
     }
 
-    function applyWorkMode(mode, { focusEditor = false } = {}) {
+    function applyWorkMode(mode) {
         if (mode !== "board" && mode !== "direct") {
             mode = "board";
         }
@@ -763,18 +756,11 @@
         if (boardMode && state.activeBoardId) {
             renderActiveDocument();
         }
-        if (boardMode && focusEditor) {
-            if (!focusSharedInput()) {
-                state.pendingBoardFocusId = state.activeBoardId;
-            }
-        }
         renderDirectStatus();
     }
 
     function requestWorkMode(mode) {
-        applyWorkMode(mode, {
-            focusEditor: mode === "board",
-        });
+        applyWorkMode(mode);
     }
 
     function graphemes(text) {
@@ -1185,7 +1171,7 @@
             });
             renderBoardTabs();
             if (message.sourceId === state.clientId) {
-                selectBoard(message.board.id, { focusEditor: true });
+                selectBoard(message.board.id);
             }
             return;
         }
@@ -1329,7 +1315,7 @@
 
     async function copyToCurrentDevice() {
         if (globalThis.isSecureContext && navigator.clipboard?.writeText) {
-            await navigator.clipboard.writeText(input.value);
+            await navigator.clipboard.writeText(sharedTextValue());
             return;
         }
         try {
@@ -1415,7 +1401,20 @@
         if (!documentState) {
             return;
         }
-        documentState.localText = input.value;
+        documentState.localText = sharedTextValue();
+        if (input.value !== documentState.localText && documentState.localText) {
+            const cursor = Math.max(
+                0,
+                (input.selectionStart ?? input.value.length) -
+                    input.value
+                        .slice(0, input.selectionStart ?? input.value.length)
+                        .split(EMPTY_INPUT_SENTINEL).length +
+                    1,
+            );
+            input.value = documentState.localText;
+            input.setSelectionRange(cursor, cursor);
+        }
+        keepEmptySharedInputEditable();
         updateMeta();
         notifyWhenLimitIsReached();
         saveDraft(
@@ -1549,12 +1548,12 @@
     }
 
     clearButton.addEventListener("click", () => {
-        if (!input.value || !confirm("确定清空当前共享板吗？")) {
+        if (!sharedTextValue() || !confirm("确定清空当前共享板吗？")) {
             return;
         }
+        input.blur();
         input.value = "";
         input.dispatchEvent(new Event("input"));
-        input.focus();
     });
 
     if (directCapture) {
@@ -1591,7 +1590,26 @@
         });
     }
 
-    input.addEventListener("pointerdown", reactivateEmptySharedInput);
+    input.addEventListener("beforeinput", (event) => {
+        if (
+            input.value === EMPTY_INPUT_SENTINEL &&
+            event.inputType?.startsWith("insert")
+        ) {
+            input.value = "";
+        }
+    });
+    input.addEventListener("compositionstart", () => {
+        if (input.value === EMPTY_INPUT_SENTINEL) {
+            input.value = "";
+        }
+    });
+    input.addEventListener("compositionend", keepEmptySharedInputEditable);
+    input.addEventListener("focus", keepEmptySharedInputEditable);
+    input.addEventListener("blur", () => {
+        if (input.value === EMPTY_INPUT_SENTINEL) {
+            input.value = "";
+        }
+    });
     editorCard.addEventListener("click", (event) => {
         if (event.target === editorCard) {
             focusSharedInput();

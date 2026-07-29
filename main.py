@@ -27,6 +27,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 FIREWALL_MARKER_NAME = "firewall.json"
+FIREWALL_MARKER_VERSION = 2
 
 
 def configured_port() -> int:
@@ -49,7 +50,6 @@ def show_message(title: str, text: str) -> None:
 
 def _firewall_marker_matches(
     marker_path: Path,
-    executable: Path,
     port: int,
 ) -> bool:
     try:
@@ -57,15 +57,13 @@ def _firewall_marker_matches(
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return False
     return marker == {
-        "version": 1,
-        "executable": str(executable),
+        "version": FIREWALL_MARKER_VERSION,
         "port": port,
     }
 
 
 def _write_firewall_marker(
     marker_path: Path,
-    executable: Path,
     port: int,
 ) -> None:
     marker_path.parent.mkdir(parents=True, exist_ok=True)
@@ -73,8 +71,7 @@ def _write_firewall_marker(
     temporary_path.write_text(
         json.dumps(
             {
-                "version": 1,
-                "executable": str(executable),
+                "version": FIREWALL_MARKER_VERSION,
                 "port": port,
             },
             ensure_ascii=False,
@@ -91,43 +88,22 @@ def ensure_windows_firewall_access(
     *,
     host: str = "0.0.0.0",
 ) -> bool:
-    """Configure one private-LAN rule for a packaged EasyType executable."""
+    """Allow the EasyType port from the local subnet on any network profile."""
     if (
         os.name != "nt"
-        or not getattr(sys, "frozen", False)
         or host in {"127.0.0.1", "::1", "localhost"}
     ):
         return True
 
-    executable = Path(sys.executable).resolve()
     resolved_data_dir = Path(data_dir) if data_dir is not None else default_data_dir()
     marker_path = resolved_data_dir / FIREWALL_MARKER_NAME
-    if _firewall_marker_matches(marker_path, executable, port):
+    if _firewall_marker_matches(marker_path, port):
         return True
 
-    escaped_executable = str(executable).replace("'", "''")
     elevated_script = f"""
 $ErrorActionPreference = 'Stop'
-$easyTypeExecutable = '{escaped_executable}'
 $easyTypePort = {port}
 $displayName = "EasyType LAN TCP $easyTypePort"
-
-Get-NetFirewallRule -Direction Inbound -Action Block -ErrorAction SilentlyContinue |
-    ForEach-Object {{
-        $application = Get-NetFirewallApplicationFilter `
-            -AssociatedNetFirewallRule $_ `
-            -ErrorAction SilentlyContinue
-        if (
-            $application.Program -and
-            [string]::Equals(
-                $application.Program,
-                $easyTypeExecutable,
-                [StringComparison]::OrdinalIgnoreCase
-            )
-        ) {{
-            Remove-NetFirewallRule -Name $_.Name -ErrorAction SilentlyContinue
-        }}
-    }}
 
 Get-NetFirewallRule -Group 'EasyType' -ErrorAction SilentlyContinue |
     Remove-NetFirewallRule -ErrorAction SilentlyContinue
@@ -141,9 +117,8 @@ New-NetFirewallRule `
     -Action Allow `
     -Protocol TCP `
     -LocalPort $easyTypePort `
-    -Profile Private `
-    -RemoteAddress LocalSubnet `
-    -Program $easyTypeExecutable | Out-Null
+    -Profile Any `
+    -RemoteAddress LocalSubnet | Out-Null
 """
     encoded_script = base64.b64encode(
         elevated_script.encode("utf-16-le")
@@ -187,7 +162,7 @@ New-NetFirewallRule `
         return False
 
     try:
-        _write_firewall_marker(marker_path, executable, port)
+        _write_firewall_marker(marker_path, port)
     except OSError:
         logger.warning("Firewall access was configured, but its marker could not be saved.")
     return True
