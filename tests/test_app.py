@@ -106,7 +106,7 @@ def test_local_editor_and_info_are_available(client, monkeypatch):
     assert 'id="markdownAssistToggle"' in page_text
     assert 'role="switch"' in page_text
     assert "保持纯文本，不进行渲染" in page_text
-    assert "EasyType v1.2.0" in page_text
+    assert "EasyType v1.3.0" in page_text
     assert "http://192.168.1.10:5000" in page_text
     assert re.search(r'id="copyButton"[^>]*>\s*复制\s*</button>', page_text)
     assert 'id="remoteEnterButton"' not in page_text
@@ -120,7 +120,7 @@ def test_local_editor_and_info_are_available(client, monkeypatch):
     assert 'class="action-card"' not in page_text
     assert 'class="editor-action-note"' not in page_text
     assert info.status_code == 200
-    assert info.get_json()["version"] == "1.2.0"
+    assert info.get_json()["version"] == "1.3.0"
     assert info.get_json()["revision"] == 0
     assert info.get_json()["boardCount"] == 3
     assert info.get_json()["maxBoards"] == 8

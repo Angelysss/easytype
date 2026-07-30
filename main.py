@@ -14,7 +14,12 @@ from pathlib import Path
 
 from werkzeug.serving import make_server
 
-from easytype_app import create_app, default_data_dir
+from easytype_app import APP_VERSION, create_app, default_data_dir
+
+try:
+    import winreg
+except ImportError:
+    winreg = None
 
 try:
     import pystray
@@ -28,6 +33,9 @@ except ImportError:
 logger = logging.getLogger(__name__)
 FIREWALL_MARKER_NAME = "firewall.json"
 FIREWALL_MARKER_VERSION = 3
+GITHUB_URL = "https://github.com/Angelysss/easytype"
+STARTUP_REGISTRY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_REGISTRY_VALUE = "EasyType"
 
 
 def configured_port() -> int:
@@ -46,6 +54,86 @@ def show_message(title: str, text: str) -> None:
         ctypes.windll.user32.MessageBoxW(0, text, title, 0x40)
     except Exception:
         logger.warning("%s: %s", title, text)
+
+
+def startup_command(
+    host: str,
+    port: int,
+    data_dir: Path | None = None,
+) -> str:
+    """Return the command saved for this EasyType installation at sign-in."""
+    if getattr(sys, "frozen", False):
+        arguments = [str(Path(sys.executable).resolve())]
+    else:
+        interpreter = Path(sys.executable).resolve()
+        pythonw = interpreter.with_name("pythonw.exe")
+        if pythonw.exists():
+            interpreter = pythonw
+        arguments = [
+            str(interpreter),
+            str(Path(__file__).resolve()),
+        ]
+
+    arguments.extend(["--host", host, "--port", str(port)])
+    if data_dir is not None:
+        arguments.extend(["--data-dir", str(Path(data_dir).resolve())])
+    return subprocess.list2cmdline(arguments)
+
+
+def _read_startup_command() -> str | None:
+    if os.name != "nt" or winreg is None:
+        return None
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            STARTUP_REGISTRY_PATH,
+            0,
+            winreg.KEY_READ,
+        ) as key:
+            value, value_type = winreg.QueryValueEx(
+                key,
+                STARTUP_REGISTRY_VALUE,
+            )
+    except FileNotFoundError:
+        return None
+    if value_type != winreg.REG_SZ or not isinstance(value, str):
+        return None
+    return value
+
+
+def is_startup_enabled(command: str) -> bool:
+    return _read_startup_command() == command
+
+
+def set_startup_enabled(enabled: bool, command: str) -> None:
+    if os.name != "nt" or winreg is None:
+        raise OSError("开机自启动仅支持 Windows。")
+    if enabled:
+        with winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER,
+            STARTUP_REGISTRY_PATH,
+            0,
+            winreg.KEY_SET_VALUE,
+        ) as key:
+            winreg.SetValueEx(
+                key,
+                STARTUP_REGISTRY_VALUE,
+                0,
+                winreg.REG_SZ,
+                command,
+            )
+        return
+
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            STARTUP_REGISTRY_PATH,
+            0,
+            winreg.KEY_SET_VALUE,
+        ) as key:
+            winreg.DeleteValue(key, STARTUP_REGISTRY_VALUE)
+    except FileNotFoundError:
+        pass
 
 
 def _firewall_marker_matches(
@@ -245,18 +333,73 @@ class EasyTypeServer(threading.Thread):
 def create_tray_image() -> Image.Image:
     if Image is None or ImageDraw is None:
         raise RuntimeError("Pillow is not installed.")
-    image = Image.new("RGB", (64, 64), color=(24, 24, 27))
+    image = Image.new("RGBA", (64, 64), color=(0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((7, 7, 57, 57), radius=13, fill=(37, 99, 235))
     draw.rounded_rectangle(
-        (17, 16, 47, 48),
-        radius=5,
-        outline=(255, 255, 255),
-        width=4,
+        (4, 4, 59, 59),
+        radius=17,
+        fill=(37, 99, 235, 255),
+        outline=(96, 165, 250, 255),
+        width=2,
     )
-    draw.line((23, 26, 41, 26), fill=(255, 255, 255), width=3)
-    draw.line((23, 35, 41, 35), fill=(255, 255, 255), width=3)
+    draw.rounded_rectangle(
+        (8, 8, 55, 30),
+        radius=13,
+        fill=(59, 130, 246, 255),
+    )
+    glyph_color = (255, 255, 255, 255)
+    draw.rounded_rectangle((18, 16, 23, 48), radius=2, fill=glyph_color)
+    draw.rounded_rectangle((20, 16, 46, 21), radius=2, fill=glyph_color)
+    draw.rounded_rectangle((20, 29, 41, 34), radius=2, fill=glyph_color)
+    draw.rounded_rectangle((20, 43, 46, 48), radius=2, fill=glyph_color)
     return image
+
+
+def create_tray_menu(
+    editor_url: str,
+    server: EasyTypeServer,
+    current_startup_command: str,
+) -> pystray.Menu:
+    if pystray is None:
+        raise RuntimeError("pystray is not installed.")
+
+    def open_editor(_icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+        webbrowser.open(editor_url)
+
+    def toggle_startup(icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+        try:
+            set_startup_enabled(
+                not is_startup_enabled(current_startup_command),
+                current_startup_command,
+            )
+        except OSError as error:
+            show_message("EasyType 开机自启动", f"设置失败：{error}")
+        finally:
+            icon.update_menu()
+
+    def open_github(_icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+        webbrowser.open(GITHUB_URL)
+
+    def exit_app(icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+        logger.info("EasyType is shutting down.")
+        server.shutdown()
+        icon.stop()
+
+    return pystray.Menu(
+        pystray.MenuItem("打开共享文本板", open_editor, default=True),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(
+            "开机自启动",
+            toggle_startup,
+            checked=lambda _item: is_startup_enabled(
+                current_startup_command,
+            ),
+        ),
+        pystray.MenuItem(f"EasyType v{APP_VERSION}", None, enabled=False),
+        pystray.MenuItem("GitHub", open_github),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("退出", exit_app),
+    )
 
 
 def run_with_tray(host: str, port: int, data_dir: Path | None = None) -> None:
@@ -286,22 +429,19 @@ def run_with_tray(host: str, port: int, data_dir: Path | None = None) -> None:
 
     server.start()
     editor_url = f"http://127.0.0.1:{port}/"
+    current_startup_command = startup_command(host, port, data_dir)
     logger.info("EasyType started on port %s.", port)
-
-    def open_editor(_icon: pystray.Icon, _item: pystray.MenuItem) -> None:
-        webbrowser.open(editor_url)
-
-    def exit_app(icon: pystray.Icon, _item: pystray.MenuItem) -> None:
-        logger.info("EasyType is shutting down.")
-        server.shutdown()
-        icon.stop()
-
-    menu = pystray.Menu(
-        pystray.MenuItem("打开共享文本板", open_editor, default=True),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("退出", exit_app),
+    menu = create_tray_menu(
+        editor_url,
+        server,
+        current_startup_command,
     )
-    icon = pystray.Icon("EasyType", create_tray_image(), "EasyType", menu)
+    icon = pystray.Icon(
+        "EasyType",
+        create_tray_image(),
+        f"EasyType v{APP_VERSION}",
+        menu,
+    )
     icon.run()
 
 

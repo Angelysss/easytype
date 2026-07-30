@@ -1,11 +1,52 @@
 import base64
 import re
+import subprocess
 import sys
 from types import SimpleNamespace
 
 import pytest
 
 import main
+
+
+class FakeRegistryKey:
+    def __init__(self, registry):
+        self.registry = registry
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+class FakeRegistry:
+    HKEY_CURRENT_USER = object()
+    KEY_READ = 1
+    KEY_SET_VALUE = 2
+    REG_SZ = 1
+
+    def __init__(self):
+        self.values = {}
+
+    def OpenKey(self, *_args):
+        return FakeRegistryKey(self)
+
+    def CreateKeyEx(self, *_args):
+        return FakeRegistryKey(self)
+
+    def QueryValueEx(self, _key, name):
+        if name not in self.values:
+            raise FileNotFoundError(name)
+        return self.values[name]
+
+    def SetValueEx(self, _key, name, _reserved, value_type, value):
+        self.values[name] = (value, value_type)
+
+    def DeleteValue(self, _key, name):
+        if name not in self.values:
+            raise FileNotFoundError(name)
+        del self.values[name]
 
 
 def test_configured_port_uses_environment(monkeypatch):
@@ -20,6 +61,152 @@ def test_configured_port_rejects_invalid_values(monkeypatch, value):
 
     with pytest.raises(ValueError):
         main.configured_port()
+
+
+def test_source_startup_command_uses_pythonw_and_current_options(
+    monkeypatch,
+    tmp_path,
+):
+    scripts = tmp_path / "Scripts"
+    scripts.mkdir()
+    python = scripts / "python.exe"
+    pythonw = scripts / "pythonw.exe"
+    source = tmp_path / "main.py"
+    python.touch()
+    pythonw.touch()
+    source.touch()
+    data_dir = tmp_path / "EasyType Data"
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setattr(sys, "executable", str(python))
+    monkeypatch.setattr(main, "__file__", str(source))
+
+    command = main.startup_command("0.0.0.0", 6123, data_dir)
+
+    assert command == subprocess.list2cmdline(
+        [
+            str(pythonw.resolve()),
+            str(source.resolve()),
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "6123",
+            "--data-dir",
+            str(data_dir.resolve()),
+        ]
+    )
+
+
+def test_frozen_startup_command_uses_only_executable(monkeypatch, tmp_path):
+    executable = tmp_path / "EasyType-1.3.0.exe"
+    executable.touch()
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(executable))
+
+    command = main.startup_command("0.0.0.0", 5000)
+
+    assert command == subprocess.list2cmdline(
+        [
+            str(executable.resolve()),
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "5000",
+        ]
+    )
+
+
+def test_startup_registry_toggle_only_changes_easytype_value(monkeypatch):
+    registry = FakeRegistry()
+    registry.values["OtherApp"] = ("other.exe", registry.REG_SZ)
+    monkeypatch.setattr(main, "winreg", registry)
+    monkeypatch.setattr(main.os, "name", "nt")
+    command = r'"C:\EasyType\EasyType.exe" --port 5000'
+
+    assert main.is_startup_enabled(command) is False
+    main.set_startup_enabled(True, command)
+    assert main.is_startup_enabled(command) is True
+    assert registry.values["OtherApp"] == ("other.exe", registry.REG_SZ)
+
+    main.set_startup_enabled(False, command)
+    assert main.is_startup_enabled(command) is False
+    assert registry.values["OtherApp"] == ("other.exe", registry.REG_SZ)
+
+
+def test_tray_image_has_transparent_background_and_blue_badge():
+    image = main.create_tray_image()
+
+    assert image.mode == "RGBA"
+    assert image.size == (64, 64)
+    assert image.getpixel((0, 0)) == (0, 0, 0, 0)
+    assert image.getpixel((6, 32))[2] > image.getpixel((6, 32))[0]
+    assert image.getpixel((21, 18)) == (255, 255, 255, 255)
+
+
+def test_tray_menu_controls_startup_and_opens_links(monkeypatch):
+    registry = FakeRegistry()
+    opened_urls = []
+    server = SimpleNamespace(
+        shutdown_calls=0,
+        shutdown=lambda: setattr(
+            server,
+            "shutdown_calls",
+            server.shutdown_calls + 1,
+        ),
+    )
+    icon = SimpleNamespace(
+        menu_updates=0,
+        stop_calls=0,
+        update_menu=lambda: setattr(
+            icon,
+            "menu_updates",
+            icon.menu_updates + 1,
+        ),
+        stop=lambda: setattr(icon, "stop_calls", icon.stop_calls + 1),
+    )
+    monkeypatch.setattr(main, "winreg", registry)
+    monkeypatch.setattr(main.os, "name", "nt")
+    monkeypatch.setattr(
+        main.webbrowser,
+        "open",
+        lambda url: opened_urls.append(url),
+    )
+    command = r'"C:\EasyType\EasyType.exe" --port 5000'
+
+    menu = main.create_tray_menu(
+        "http://127.0.0.1:5000/",
+        server,
+        command,
+    )
+    items = list(menu)
+
+    assert [item.text for item in items] == [
+        "打开共享文本板",
+        "- - - -",
+        "开机自启动",
+        "EasyType v1.3.0",
+        "GitHub",
+        "- - - -",
+        "退出",
+    ]
+    assert items[2].checked is False
+    assert items[3].enabled is False
+
+    items[2](icon)
+    assert items[2].checked is True
+    assert icon.menu_updates == 1
+    items[0](icon)
+    items[4](icon)
+    assert opened_urls == [
+        "http://127.0.0.1:5000/",
+        main.GITHUB_URL,
+    ]
+
+    items[2](icon)
+    assert items[2].checked is False
+    assert icon.menu_updates == 2
+    items[6](icon)
+    assert server.shutdown_calls == 1
+    assert icon.stop_calls == 1
 
 
 def test_parse_args_supports_bounded_foreground_mode(monkeypatch, tmp_path):
