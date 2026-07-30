@@ -85,6 +85,24 @@
                 </div>
             </div>
             <div class="about-details">
+                <div class="about-item about-setting-item">
+                    <div>
+                        <strong>Markdown 编辑辅助</strong>
+                        <p>
+                            保持纯文本，不进行渲染；启用后，回车会自动延续列表、
+                            任务列表和引用标记。此开关只保存在当前浏览器。
+                        </p>
+                    </div>
+                    <label class="toggle-control" for="markdownAssistToggle">
+                        <input
+                            id="markdownAssistToggle"
+                            type="checkbox"
+                            role="switch"
+                            aria-label="启用 Markdown 编辑辅助"
+                        >
+                        <span class="toggle-track" aria-hidden="true"></span>
+                    </label>
+                </div>
                 <div class="about-item">
                     <strong>手机端“插入”的作用</strong>
                     <p>
@@ -203,9 +221,14 @@
                 <p class="hint">
                     切回配对模式后，未配对设备会立即断开；已有设备授权不会被删除。
                 </p>
-                <button id="saveAccessModeButton" class="button primary" type="button">
-                    应用模式
-                </button>
+                <div class="access-settings-actions">
+                    <button id="repairNetworkAccessButton" class="button secondary" type="button">
+                        修复网络访问
+                    </button>
+                    <button id="saveAccessModeButton" class="button primary" type="button">
+                        应用模式
+                    </button>
+                </div>
             </div>
         </section>
         {% endif %}

@@ -27,7 +27,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 FIREWALL_MARKER_NAME = "firewall.json"
-FIREWALL_MARKER_VERSION = 2
+FIREWALL_MARKER_VERSION = 3
 
 
 def configured_port() -> int:
@@ -82,11 +82,25 @@ def _write_firewall_marker(
     os.replace(temporary_path, marker_path)
 
 
+def _firewall_program_paths() -> list[Path]:
+    candidates = [Path(sys.executable).resolve()]
+    if not getattr(sys, "frozen", False):
+        base_executable = getattr(sys, "_base_executable", None)
+        if base_executable:
+            candidates.append(Path(base_executable).resolve())
+
+    unique: dict[str, Path] = {}
+    for candidate in candidates:
+        unique.setdefault(str(candidate).casefold(), candidate)
+    return list(unique.values())
+
+
 def ensure_windows_firewall_access(
     port: int,
     data_dir: Path | None = None,
     *,
     host: str = "0.0.0.0",
+    force: bool = False,
 ) -> bool:
     """Allow the EasyType port from the local subnet on any network profile."""
     if (
@@ -97,13 +111,49 @@ def ensure_windows_firewall_access(
 
     resolved_data_dir = Path(data_dir) if data_dir is not None else default_data_dir()
     marker_path = resolved_data_dir / FIREWALL_MARKER_NAME
-    if _firewall_marker_matches(marker_path, port):
+    if not force and _firewall_marker_matches(marker_path, port):
         return True
 
+    escaped_programs = ",\n".join(
+        "    '" + str(program).replace("'", "''") + "'"
+        for program in _firewall_program_paths()
+    )
     elevated_script = f"""
 $ErrorActionPreference = 'Stop'
 $easyTypePort = {port}
 $displayName = "EasyType LAN TCP $easyTypePort"
+$easyTypePrograms = @(
+{escaped_programs}
+)
+
+foreach (
+    $blockRule in @(
+        Get-NetFirewallRule `
+            -Enabled True `
+            -Direction Inbound `
+            -Action Block `
+            -ErrorAction SilentlyContinue
+    )
+) {{
+    $blockedProgram = (
+        Get-NetFirewallApplicationFilter `
+            -AssociatedNetFirewallRule $blockRule `
+            -ErrorAction SilentlyContinue
+    ).Program
+    foreach ($easyTypeProgram in $easyTypePrograms) {{
+        if (
+            $blockedProgram -and
+            [string]::Equals(
+                $blockedProgram,
+                $easyTypeProgram,
+                [StringComparison]::OrdinalIgnoreCase
+            )
+        ) {{
+            Remove-NetFirewallRule -Name $blockRule.Name -ErrorAction SilentlyContinue
+            break
+        }}
+    }}
+}}
 
 Get-NetFirewallRule -Group 'EasyType' -ErrorAction SilentlyContinue |
     Remove-NetFirewallRule -ErrorAction SilentlyContinue
@@ -171,7 +221,16 @@ New-NetFirewallRule `
 class EasyTypeServer(threading.Thread):
     def __init__(self, host: str, port: int, data_dir: Path | None = None):
         super().__init__(daemon=True)
-        self.app = create_app(port=port, data_dir=data_dir)
+        self.app = create_app(
+            port=port,
+            data_dir=data_dir,
+            network_repair_callback=lambda: ensure_windows_firewall_access(
+                port,
+                data_dir,
+                host=host,
+                force=True,
+            ),
+        )
         self.server = make_server(host, port, self.app, threaded=True)
 
     def run(self) -> None:
@@ -206,7 +265,16 @@ def run_with_tray(host: str, port: int, data_dir: Path | None = None) -> None:
             "EasyType",
             "缺少 pystray 或 Pillow，将以前台模式启动。请执行 uv sync 补齐依赖。",
         )
-        app = create_app(port=port, data_dir=data_dir)
+        app = create_app(
+            port=port,
+            data_dir=data_dir,
+            network_repair_callback=lambda: ensure_windows_firewall_access(
+                port,
+                data_dir,
+                host=host,
+                force=True,
+            ),
+        )
         app.run(host=host, port=port, debug=False, threaded=True)
         return
 
@@ -275,7 +343,16 @@ def main() -> None:
             "EasyType 后可以再次授权。",
         )
     if args.no_tray:
-        create_app(port=port, data_dir=args.data_dir).run(
+        create_app(
+            port=port,
+            data_dir=args.data_dir,
+            network_repair_callback=lambda: ensure_windows_firewall_access(
+                port,
+                args.data_dir,
+                host=args.host,
+                force=True,
+            ),
+        ).run(
             host=args.host,
             port=port,
             debug=False,

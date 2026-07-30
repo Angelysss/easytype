@@ -279,6 +279,64 @@ body.about-open {
     line-height: 1.5;
 }
 
+.about-setting-item {
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 16px;
+}
+
+.toggle-control {
+    position: relative;
+    display: inline-flex;
+    flex: 0 0 auto;
+    cursor: pointer;
+}
+
+.toggle-control input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+}
+
+.toggle-track {
+    position: relative;
+    display: block;
+    width: 46px;
+    height: 26px;
+    border: 1px solid #cbd5e1;
+    border-radius: 999px;
+    background: #e2e8f0;
+    transition: border-color 160ms ease, background 160ms ease;
+}
+
+.toggle-track::after {
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: white;
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.24);
+    content: "";
+    transition: transform 160ms ease;
+}
+
+.toggle-control input:checked + .toggle-track {
+    border-color: var(--primary);
+    background: var(--primary);
+}
+
+.toggle-control input:checked + .toggle-track::after {
+    transform: translateX(20px);
+}
+
+.toggle-control input:focus-visible + .toggle-track {
+    outline: 3px solid rgba(37, 99, 235, 0.18);
+    outline-offset: 2px;
+}
+
 .rename-board-dialog {
     width: min(calc(100% - 28px), 420px);
     padding: 0;
@@ -426,6 +484,14 @@ body.about-open {
 
 .access-settings-footer .hint {
     margin: 0;
+}
+
+.access-settings-actions {
+    display: flex;
+    flex: none;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 10px;
 }
 
 .editor-card {
@@ -1279,6 +1345,11 @@ button.direct-wave:focus-visible {
     .access-settings-footer {
         align-items: stretch;
         flex-direction: column;
+    }
+
+    .access-settings-actions {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
     }
 
     .trusted-lan-access {

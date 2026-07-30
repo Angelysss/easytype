@@ -6,7 +6,11 @@
     const CLIENT_ID_KEY = "easytype.clientId.v1";
     const ACTIVE_BOARD_KEY = "easytype.activeBoard.v1";
     const WORK_MODE_KEY = "easytype.workMode.v1";
+    const MARKDOWN_ASSIST_KEY = "easytype.markdownAssist.v1";
     const DIRECT_FLUSH_DELAY_MS = 45;
+    const HEARTBEAT_INTERVAL_MS = 25000;
+    const HEARTBEAT_TIMEOUT_MS = 75000;
+    const RESUME_PROBE_TIMEOUT_MS = 15000;
     const EMPTY_INPUT_SENTINEL = "\u200b";
     const textEncoder = new TextEncoder();
 
@@ -30,10 +34,14 @@
     const aboutPanel = document.getElementById("aboutPanel");
     const aboutBackdrop = document.getElementById("aboutBackdrop");
     const closeAboutButton = document.getElementById("closeAboutButton");
+    const markdownAssistToggle = document.getElementById("markdownAssistToggle");
     const accessSettingsButton = document.getElementById("accessSettingsButton");
     const accessSettingsPanel = document.getElementById("accessSettingsPanel");
     const closeAccessSettingsButton = document.getElementById("closeAccessSettingsButton");
     const saveAccessModeButton = document.getElementById("saveAccessModeButton");
+    const repairNetworkAccessButton = document.getElementById(
+        "repairNetworkAccessButton",
+    );
     const deviceManagementLink = document.getElementById("deviceManagementLink");
     const trustedLanAccess = document.getElementById("trustedLanAccess");
     const boardModeButton = document.getElementById("boardModeButton");
@@ -69,9 +77,17 @@
         renameDialogBoardId: null,
         reconnectTimer: null,
         reconnectAttempt: 0,
+        connectionGeneration: 0,
+        heartbeatTimer: null,
+        heartbeatProbeTimer: null,
+        lastServerMessageAt: 0,
         manuallyClosed: false,
         initialized: false,
         limitNoticeShown: false,
+        markdownAssistEnabled:
+            localStorage.getItem(MARKDOWN_ASSIST_KEY) === "true",
+        markdownKeydownHandled: false,
+        sharedComposing: false,
         clientId: getClientId(),
         direct: {
             serverStatus: { active: false },
@@ -112,8 +128,13 @@
         if (!socketReady()) {
             return false;
         }
-        state.socket.send(JSON.stringify(message));
-        return true;
+        try {
+            state.socket.send(JSON.stringify(message));
+            return true;
+        } catch (_error) {
+            state.socket.close(4000, "Send failed");
+            return false;
+        }
     }
 
     function setConnection(status, label) {
@@ -368,6 +389,80 @@
     function setSharedTextValue(text) {
         input.value = text;
         keepEmptySharedInputEditable();
+    }
+
+    function markdownLinePrefix(line) {
+        let match = line.match(/^(\s*)([-+*])\s+\[([ xX])\]\s*(.*)$/);
+        if (match) {
+            return {
+                empty: !match[4].trim(),
+                prefix: `${match[1]}${match[2]} [ ] `,
+            };
+        }
+
+        match = line.match(/^(\s*)([-+*])\s+(.*)$/);
+        if (match) {
+            return {
+                empty: !match[3].trim(),
+                prefix: `${match[1]}${match[2]} `,
+            };
+        }
+
+        match = line.match(/^(\s*)(\d+)([.)])\s+(.*)$/);
+        if (match) {
+            return {
+                empty: !match[4].trim(),
+                prefix: `${match[1]}${Number(match[2]) + 1}${match[3]} `,
+            };
+        }
+
+        match = line.match(/^(\s*(?:>\s*)+)(.*)$/);
+        if (match) {
+            return {
+                empty: !match[2].trim(),
+                prefix: match[1],
+            };
+        }
+        return null;
+    }
+
+    function markdownLineBreakEdit() {
+        if (
+            !state.markdownAssistEnabled ||
+            state.sharedComposing ||
+            input.selectionStart !== input.selectionEnd
+        ) {
+            return null;
+        }
+
+        const text = sharedTextValue();
+        const cursor = input.selectionStart;
+        const lineStart = text.lastIndexOf("\n", cursor - 1) + 1;
+        const nextLineBreak = text.indexOf("\n", cursor);
+        const lineEnd = nextLineBreak === -1 ? text.length : nextLineBreak;
+        const continuation = markdownLinePrefix(text.slice(lineStart, lineEnd));
+        if (!continuation) {
+            return null;
+        }
+
+        if (continuation.empty && cursor === lineEnd) {
+            return {
+                start: lineStart,
+                end: lineEnd,
+                text: "",
+            };
+        }
+
+        return {
+            start: cursor,
+            end: cursor,
+            text: `\n${continuation.prefix}`,
+        };
+    }
+
+    function applyMarkdownLineBreak(edit) {
+        input.setRangeText(edit.text, edit.start, edit.end, "end");
+        input.dispatchEvent(new Event("input", { bubbles: true }));
     }
 
     function updateMeta() {
@@ -1239,19 +1334,113 @@
         }
     }
 
+    function stopHeartbeat() {
+        clearInterval(state.heartbeatTimer);
+        clearTimeout(state.heartbeatProbeTimer);
+        state.heartbeatTimer = null;
+        state.heartbeatProbeTimer = null;
+    }
+
+    function noteServerMessage(socket) {
+        if (state.socket !== socket) {
+            return;
+        }
+        state.lastServerMessageAt = Date.now();
+        clearTimeout(state.heartbeatProbeTimer);
+        state.heartbeatProbeTimer = null;
+    }
+
+    function sendHeartbeat(socket, verifyResume = false) {
+        if (
+            state.socket !== socket ||
+            socket.readyState !== WebSocket.OPEN
+        ) {
+            return;
+        }
+        try {
+            socket.send('{"type":"ping"}');
+        } catch (_error) {
+            socket.close(4000, "Heartbeat send failed");
+            return;
+        }
+        if (!verifyResume) {
+            return;
+        }
+        const sentAt = Date.now();
+        clearTimeout(state.heartbeatProbeTimer);
+        state.heartbeatProbeTimer = setTimeout(() => {
+            if (
+                state.socket === socket &&
+                socket.readyState === WebSocket.OPEN &&
+                state.lastServerMessageAt < sentAt
+            ) {
+                socket.close(4000, "Heartbeat timeout");
+            }
+        }, RESUME_PROBE_TIMEOUT_MS);
+    }
+
+    function startHeartbeat(socket) {
+        stopHeartbeat();
+        state.lastServerMessageAt = Date.now();
+        state.heartbeatTimer = setInterval(() => {
+            if (
+                document.hidden ||
+                state.socket !== socket ||
+                socket.readyState !== WebSocket.OPEN
+            ) {
+                return;
+            }
+            if (
+                Date.now() - state.lastServerMessageAt >
+                HEARTBEAT_TIMEOUT_MS
+            ) {
+                socket.close(4000, "Heartbeat timeout");
+                return;
+            }
+            sendHeartbeat(socket);
+        }, HEARTBEAT_INTERVAL_MS);
+    }
+
     function connect() {
         clearTimeout(state.reconnectTimer);
+        state.reconnectTimer = null;
+        if (
+            state.socket?.readyState === WebSocket.OPEN ||
+            state.socket?.readyState === WebSocket.CONNECTING
+        ) {
+            return;
+        }
+        stopHeartbeat();
+        const generation = state.connectionGeneration + 1;
+        state.connectionGeneration = generation;
         setConnection("connecting", "未连接");
+        connectionBadge.title = "正在建立实时连接";
         const scheme = location.protocol === "https:" ? "wss" : "ws";
         const socket = new WebSocket(`${scheme}://${location.host}/ws`);
         state.socket = socket;
 
         socket.addEventListener("open", () => {
+            if (
+                state.socket !== socket ||
+                state.connectionGeneration !== generation
+            ) {
+                socket.close(1000, "Superseded connection");
+                return;
+            }
             state.reconnectAttempt = 0;
+            connectionBadge.title = "实时连接正常";
             setConnection("online", "已连接");
+            startHeartbeat(socket);
         });
 
         socket.addEventListener("message", (event) => {
+            if (
+                state.socket !== socket ||
+                state.connectionGeneration !== generation
+            ) {
+                return;
+            }
+            noteServerMessage(socket);
             try {
                 handleMessage(JSON.parse(event.data));
             } catch (_error) {
@@ -1260,9 +1449,17 @@
         });
 
         socket.addEventListener("close", (event) => {
-            if (state.socket !== socket) {
+            if (
+                state.socket !== socket ||
+                state.connectionGeneration !== generation
+            ) {
                 return;
             }
+            stopHeartbeat();
+            state.socket = null;
+            connectionBadge.title = event.reason
+                ? `连接已断开（${event.code}：${event.reason}）`
+                : `连接已断开（${event.code}）`;
             setConnection("offline", "未连接");
             resetDirectState();
             for (const [boardId, documentState] of state.documents) {
@@ -1438,6 +1635,19 @@
     });
     closeAboutButton.addEventListener("click", () => setAboutOpen(false));
     aboutBackdrop.addEventListener("click", () => setAboutOpen(false));
+    markdownAssistToggle.checked = state.markdownAssistEnabled;
+    markdownAssistToggle.addEventListener("change", () => {
+        state.markdownAssistEnabled = markdownAssistToggle.checked;
+        localStorage.setItem(
+            MARKDOWN_ASSIST_KEY,
+            String(state.markdownAssistEnabled),
+        );
+        showToast(
+            state.markdownAssistEnabled
+                ? "已启用 Markdown 编辑辅助。"
+                : "已关闭 Markdown 编辑辅助。",
+        );
+    });
     document.addEventListener("keydown", (event) => {
         if (event.key === "Escape" && !aboutPanel.hidden) {
             setAboutOpen(false);
@@ -1510,6 +1720,32 @@
                 showToast(error.message, true);
             } finally {
                 saveAccessModeButton.disabled = false;
+            }
+        });
+        repairNetworkAccessButton.addEventListener("click", async () => {
+            repairNetworkAccessButton.disabled = true;
+            repairNetworkAccessButton.textContent = "等待 Windows 确认…";
+            try {
+                const response = await fetch(
+                    "/api/admin/network-access/repair",
+                    {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: "{}",
+                    },
+                );
+                const payload = await response.json();
+                if (!response.ok) {
+                    throw new Error(
+                        payload.error?.message ?? "修复网络访问失败。",
+                    );
+                }
+                showToast("网络访问权限已重新配置。");
+            } catch (error) {
+                showToast(error.message, true);
+            } finally {
+                repairNetworkAccessButton.disabled = false;
+                repairNetworkAccessButton.textContent = "修复网络访问";
             }
         });
     }
@@ -1592,6 +1828,21 @@
 
     input.addEventListener("beforeinput", (event) => {
         if (
+            ["insertLineBreak", "insertParagraph"].includes(event.inputType)
+        ) {
+            if (state.markdownKeydownHandled) {
+                event.preventDefault();
+                state.markdownKeydownHandled = false;
+                return;
+            }
+            const edit = markdownLineBreakEdit();
+            if (edit) {
+                event.preventDefault();
+                applyMarkdownLineBreak(edit);
+                return;
+            }
+        }
+        if (
             input.value === EMPTY_INPUT_SENTINEL &&
             event.inputType?.startsWith("insert")
         ) {
@@ -1599,11 +1850,35 @@
         }
     });
     input.addEventListener("compositionstart", () => {
+        state.sharedComposing = true;
         if (input.value === EMPTY_INPUT_SENTINEL) {
             input.value = "";
         }
     });
-    input.addEventListener("compositionend", keepEmptySharedInputEditable);
+    input.addEventListener("compositionend", () => {
+        state.sharedComposing = false;
+        keepEmptySharedInputEditable();
+    });
+    input.addEventListener("keydown", (event) => {
+        if (
+            event.key !== "Enter" ||
+            event.shiftKey ||
+            event.ctrlKey ||
+            event.altKey ||
+            event.metaKey
+        ) {
+            return;
+        }
+        const edit = markdownLineBreakEdit();
+        if (edit) {
+            event.preventDefault();
+            state.markdownKeydownHandled = true;
+            applyMarkdownLineBreak(edit);
+            setTimeout(() => {
+                state.markdownKeydownHandled = false;
+            }, 0);
+        }
+    });
     input.addEventListener("focus", keepEmptySharedInputEditable);
     input.addEventListener("blur", () => {
         if (input.value === EMPTY_INPUT_SENTINEL) {
@@ -1633,6 +1908,7 @@
 
     window.addEventListener("pagehide", () => {
         state.manuallyClosed = true;
+        stopHeartbeat();
         for (const [boardId, documentState] of state.documents) {
             if (
                 documentState.initialized &&
@@ -1646,6 +1922,22 @@
             }
         }
         state.socket?.close();
+    });
+    window.addEventListener("pageshow", () => {
+        state.manuallyClosed = false;
+        connect();
+    });
+    document.addEventListener("visibilitychange", () => {
+        if (document.hidden || state.manuallyClosed) {
+            clearTimeout(state.heartbeatProbeTimer);
+            state.heartbeatProbeTimer = null;
+            return;
+        }
+        if (socketReady()) {
+            sendHeartbeat(state.socket, true);
+            return;
+        }
+        connect();
     });
 
     applyWorkMode(state.workMode);

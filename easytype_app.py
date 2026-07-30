@@ -34,7 +34,7 @@ from flask import (
 from flask_sock import Sock
 
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 COOKIE_NAME = "easytype_session"
 COOKIE_MAX_AGE_SECONDS = 180 * 24 * 60 * 60
 MAX_TEXT_BYTES = 1024 * 1024
@@ -1359,6 +1359,7 @@ def create_app(
     data_dir: Path | None = None,
     port: int = 5000,
     action_backend: Any | None = None,
+    network_repair_callback: Callable[[], bool] | None = None,
     testing: bool = False,
 ) -> Flask:
     resource_dir = bundled_resource_dir()
@@ -1394,6 +1395,7 @@ def create_app(
     app.extensions["easytype_hub"] = sync_hub
     app.extensions["easytype_actions"] = actions
     app.extensions["easytype_direct_input"] = direct_input
+    app.extensions["easytype_network_repair"] = network_repair_callback
 
     sock = Sock(app)
 
@@ -1739,6 +1741,30 @@ def create_app(
         ):
             sync_hub.revoke_device(TRUSTED_LAN_DEVICE_ID)
         return jsonify({"ok": True, "mode": mode})
+
+    @app.post("/api/admin/network-access/repair")
+    @require_local
+    @require_mutation_origin
+    def repair_network_access() -> Any:
+        repair = app.extensions.get("easytype_network_repair")
+        if repair is None:
+            return jsonify_error(
+                "network_repair_unavailable",
+                "当前启动方式不支持自动修复网络访问。",
+                503,
+            )
+        try:
+            repaired = bool(repair())
+        except Exception:
+            app.logger.exception("Network access repair failed.")
+            repaired = False
+        if not repaired:
+            return jsonify_error(
+                "network_repair_failed",
+                "网络授权未完成，请确认 Windows 管理员提示后重试。",
+                500,
+            )
+        return jsonify({"ok": True})
 
     @app.get("/api/admin/trusted-lan-qr")
     @require_local
@@ -2186,8 +2212,11 @@ def create_app(
                     },
                     exclude=connection_id,
                 )
-        except Exception:
-            app.logger.debug("WebSocket disconnected.", exc_info=True)
+        except Exception as error:
+            app.logger.info(
+                "WebSocket connection ended (%s).",
+                type(error).__name__,
+            )
         finally:
             direct_stopped = direct_input.stop(connection_id=connection_id)
             sync_hub.unregister(connection_id)

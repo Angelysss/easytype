@@ -41,6 +41,9 @@ def test_two_clients_sync_and_stale_update_conflicts(tmp_path):
         ]
         assert "workMode" not in first_snapshot
 
+        first.send('{"type":"ping"}')
+        assert receive_type(first, "pong")["type"] == "pong"
+
         first.send(json.dumps({
             "type": "update",
             "clientId": "computer",
