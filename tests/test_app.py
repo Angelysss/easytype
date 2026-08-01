@@ -266,8 +266,9 @@ def test_toolbar_actions_use_lightweight_anchored_feedback(client):
     assert "danger = false" in editor_javascript
     assert "duration = 1600" in editor_javascript
     assert "accessibleMessage = message" in editor_javascript
-    assert 'remoteEnterButton,\n                    "↵"' in (
-        editor_javascript
+    assert re.search(
+        r'remoteEnterButton,\r?\n\s+"↵"',
+        editor_javascript,
     )
     assert '{ accessibleMessage: "已发送回车", symbol: true }' in (
         editor_javascript
