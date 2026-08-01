@@ -1,6 +1,6 @@
 # EasyType
 
-用手机为 Windows 电脑补上共享文本板和语音输入。
+用手机为 Windows 电脑补上（豆包）语音输入。
 
 EasyType 运行在电脑上，手机和电脑通过家庭 Wi‑Fi 访问同一网页。正式版提供单文件 EXE，无需安装 Python、uv 或其他依赖。
 
