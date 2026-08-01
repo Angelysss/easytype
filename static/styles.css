@@ -77,10 +77,6 @@ a {
     gap: 14px;
 }
 
-.topbar-title-row .status-badge {
-    margin-bottom: 3px;
-}
-
 .topbar-actions {
     display: flex;
     flex-wrap: wrap;
@@ -124,35 +120,6 @@ h2 {
     font-weight: 800;
     letter-spacing: 0.16em;
     text-transform: uppercase;
-}
-
-.status-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 12px;
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    background: var(--surface);
-    color: var(--muted);
-    font-size: 0.86rem;
-    font-weight: 700;
-}
-
-.status-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: #f59e0b;
-}
-
-.status-online .status-dot {
-    background: var(--success);
-    box-shadow: 0 0 0 4px rgba(22, 163, 74, 0.12);
-}
-
-.status-offline .status-dot {
-    background: var(--danger);
 }
 
 .editor-card,
@@ -495,11 +462,66 @@ body.about-open {
 }
 
 .editor-card {
+    position: relative;
     display: flex;
     flex: 1;
     min-height: 390px;
     flex-direction: column;
     overflow: hidden;
+}
+
+body.editor-immersive {
+    overflow: hidden;
+}
+
+.editor-card.is-immersive {
+    position: fixed;
+    z-index: 20;
+    inset: 0;
+    width: 100%;
+    height: 100dvh;
+    min-height: 0;
+    border: 0;
+    border-radius: 0;
+    background: var(--surface-strong);
+    box-shadow: none;
+}
+
+.editor-expand-button {
+    position: absolute;
+    z-index: 5;
+    top: 0;
+    right: 0;
+    display: grid;
+    width: 32px;
+    height: 32px;
+    padding: 2px;
+    place-items: start end;
+    border: 0;
+    border-radius: 9px;
+    outline: 0;
+    background: transparent;
+    box-shadow: none;
+    color: var(--muted);
+    cursor: pointer;
+}
+
+.editor-expand-button:hover {
+    color: #4b5563;
+}
+
+.editor-expand-button:focus-visible {
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.16);
+}
+
+.editor-expand-button svg {
+    width: 16px;
+    height: 16px;
+    fill: none;
+    stroke: currentColor;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 2.2;
 }
 
 .work-mode-switch {
@@ -555,7 +577,7 @@ body.about-open {
     flex: 1;
     gap: 8px;
     overflow-x: auto;
-    padding: 2px;
+    padding: 7px 7px 3px 2px;
     scrollbar-width: none;
 }
 
@@ -857,10 +879,15 @@ button.direct-wave:focus-visible {
 }
 
 #sharedText {
+    --easytype-editor-inline-padding: 16px;
+
     width: 100%;
     min-height: 0;
     flex: 1;
-    padding: clamp(18px, 3vw, 32px);
+    margin-top: 5px;
+    margin-bottom: 8px;
+    padding-block: 0;
+    padding-inline: var(--easytype-editor-inline-padding);
     resize: none;
     border: 0;
     outline: 0;
@@ -897,13 +924,24 @@ button.direct-wave:focus-visible {
     white-space: nowrap;
 }
 
-.editor-meta-separator {
-    color: #c4c7ce;
+.sync-light {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    background: #f59e0b;
+    box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.14);
 }
 
-#syncState {
-    overflow: hidden;
-    text-overflow: ellipsis;
+.sync-light[data-state="synced"] {
+    background: var(--success);
+    box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.14);
+}
+
+.sync-light[data-state="error"] {
+    background: var(--danger);
+    box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.14);
 }
 
 .editor-action-buttons {
@@ -1045,16 +1083,96 @@ button.direct-wave:focus-visible {
     bottom: 18px;
     z-index: 30;
     max-width: min(360px, calc(100% - 36px));
-    padding: 12px 16px;
+    padding: 9px 13px;
+    border: 1px solid rgba(203, 213, 225, 0.86);
     border-radius: 12px;
-    background: #18181b;
-    color: white;
-    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.2);
-    font-size: 0.88rem;
+    background: rgba(255, 255, 255, 0.96);
+    color: var(--text);
+    box-shadow: 0 10px 28px rgba(15, 23, 42, 0.14);
+    font-size: 0.82rem;
+    font-weight: 700;
+    backdrop-filter: blur(12px);
+    animation: toast-arrive 160ms ease-out;
 }
 
 .toast.error {
-    background: #991b1b;
+    border-color: rgba(220, 38, 38, 0.22);
+    background: rgba(255, 241, 242, 0.97);
+    color: #b91c1c;
+}
+
+.toast.action-feedback {
+    top: var(--easytype-action-feedback-top, auto);
+    right: auto;
+    bottom: auto;
+    left: var(--easytype-action-feedback-left, 50%);
+    width: max-content;
+    white-space: nowrap;
+    padding: 6px 10px;
+    border-color: rgba(37, 99, 235, 0.16);
+    border-radius: 999px;
+    background: rgba(239, 246, 255, 0.96);
+    box-shadow: 0 6px 18px rgba(37, 99, 235, 0.12);
+    color: var(--primary);
+    font-size: 0.76rem;
+    transform: translate(-50%, -100%);
+}
+
+.toast.action-feedback.danger {
+    border-color: rgba(220, 38, 38, 0.3);
+    background: rgba(255, 255, 255, 0.98);
+    box-shadow: 0 6px 18px rgba(220, 38, 38, 0.12);
+    color: #dc2626;
+}
+
+.toast.action-feedback.symbol {
+    display: inline-flex;
+    width: 38px;
+    height: 34px;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+}
+
+.action-feedback-icon {
+    display: block;
+    width: 26px;
+    height: 26px;
+    fill: none;
+    stroke: currentColor;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 2.2;
+}
+
+.toast.action-feedback[hidden] {
+    display: none;
+}
+
+@keyframes toast-arrive {
+    from {
+        opacity: 0;
+        transform: translateY(4px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.toast.action-feedback {
+    animation-name: action-feedback-arrive;
+}
+
+@keyframes action-feedback-arrive {
+    from {
+        opacity: 0;
+        transform: translate(-50%, calc(-100% + 4px));
+    }
+    to {
+        opacity: 1;
+        transform: translate(-50%, -100%);
+    }
 }
 
 .section-heading {
@@ -1237,6 +1355,43 @@ button.direct-wave:focus-visible {
         gap: 10px;
     }
 
+    .editor-toolbar {
+        position: absolute;
+        z-index: 2;
+        right: 0;
+        bottom: 0;
+        left: 0;
+        padding: 10px 12px;
+        border-top: 0;
+        background: transparent;
+    }
+
+    #sharedText {
+        margin-bottom: var(
+            --easytype-editor-bottom-space,
+            calc(var(--easytype-editor-toolbar-height, 58px) - 8px)
+        );
+    }
+
+    body.keyboard-open .editor-toolbar {
+        position: fixed;
+        z-index: 80;
+        top: var(--easytype-floating-toolbar-top, auto);
+        bottom: auto;
+        right: max(18px, env(safe-area-inset-right));
+        left: max(18px, env(safe-area-inset-left));
+        padding: 0;
+        border: 0;
+        background: transparent;
+        box-shadow: none;
+        backdrop-filter: none;
+    }
+
+    .editor-card.is-immersive .editor-expand-button {
+        top: max(0px, env(safe-area-inset-top));
+        right: max(0px, env(safe-area-inset-right));
+    }
+
     .topbar {
         align-items: flex-end;
         flex-direction: row;
@@ -1251,10 +1406,6 @@ button.direct-wave:focus-visible {
         gap: 8px;
     }
 
-    .topbar-title-row .status-badge {
-        flex: 0 0 auto;
-    }
-
     .topbar-actions {
         flex: 0 1 auto;
         justify-content: flex-end;
@@ -1264,11 +1415,6 @@ button.direct-wave:focus-visible {
     .header-button {
         min-height: 36px;
         padding: 6px 10px;
-        font-size: 0.76rem;
-    }
-
-    .status-badge {
-        padding: 7px 10px;
         font-size: 0.76rem;
     }
 

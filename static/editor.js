@@ -7,6 +7,8 @@
     const ACTIVE_BOARD_KEY = "easytype.activeBoard.v1";
     const WORK_MODE_KEY = "easytype.workMode.v1";
     const MARKDOWN_ASSIST_KEY = "easytype.markdownAssist.v1";
+    const CLEAR_AFTER_PASTE_KEY = "easytype.clearAfterPaste.v1";
+    const EDITOR_VISUAL_GAP_PX = 8;
     const DIRECT_FLUSH_DELAY_MS = 45;
     const HEARTBEAT_INTERVAL_MS = 25000;
     const HEARTBEAT_TIMEOUT_MS = 75000;
@@ -18,10 +20,10 @@
     const isLocal = shell.dataset.isLocal === "true";
     const input = document.getElementById("sharedText");
     const editorCard = input.closest(".editor-card");
+    const editorToolbar = editorCard.querySelector(".editor-toolbar");
+    const expandEditorButton = document.getElementById("expandEditorButton");
     const charCount = document.getElementById("charCount");
     const syncState = document.getElementById("syncState");
-    const connectionBadge = document.getElementById("connectionBadge");
-    const connectionText = document.getElementById("connectionText");
     const conflictPanel = document.getElementById("conflictPanel");
     const useRemoteButton = document.getElementById("useRemoteButton");
     const keepLocalButton = document.getElementById("keepLocalButton");
@@ -35,6 +37,9 @@
     const aboutBackdrop = document.getElementById("aboutBackdrop");
     const closeAboutButton = document.getElementById("closeAboutButton");
     const markdownAssistToggle = document.getElementById("markdownAssistToggle");
+    const clearAfterPasteToggle = document.getElementById(
+        "clearAfterPasteToggle",
+    );
     const accessSettingsButton = document.getElementById("accessSettingsButton");
     const accessSettingsPanel = document.getElementById("accessSettingsPanel");
     const closeAccessSettingsButton = document.getElementById("closeAccessSettingsButton");
@@ -64,6 +69,9 @@
     const directHint = document.getElementById("directHint");
     const directBackspaceButton = document.getElementById("directBackspaceButton");
     const directEnterButton = document.getElementById("directEnterButton");
+    let visualViewportBaselineHeight = Math.round(
+        globalThis.visualViewport?.height ?? innerHeight,
+    );
 
     const state = {
         socket: null,
@@ -81,11 +89,18 @@
         heartbeatTimer: null,
         heartbeatProbeTimer: null,
         lastServerMessageAt: 0,
+        connectionStatus: "connecting",
+        connectionLabel: "未连接",
+        syncLabel: "等待连接",
         manuallyClosed: false,
         initialized: false,
         limitNoticeShown: false,
+        editorImmersive: false,
+        clearConfirmation: null,
         markdownAssistEnabled:
-            localStorage.getItem(MARKDOWN_ASSIST_KEY) === "true",
+            localStorage.getItem(MARKDOWN_ASSIST_KEY) !== "false",
+        clearAfterPasteEnabled:
+            localStorage.getItem(CLEAR_AFTER_PASTE_KEY) !== "false",
         markdownKeydownHandled: false,
         sharedComposing: false,
         clientId: getClientId(),
@@ -138,8 +153,10 @@
     }
 
     function setConnection(status, label) {
-        connectionBadge.className = `status-badge status-${status}`;
-        connectionText.textContent = label;
+        state.connectionStatus = status;
+        state.connectionLabel = label;
+        renderSyncSignal();
+        renderDirectStatus();
         updateBoardControls(status === "online");
         if (pasteButton) {
             pasteButton.disabled = status !== "online";
@@ -170,19 +187,99 @@
         }
     }
 
-    function setSync(label) {
-        syncState.textContent = label;
+    function renderSyncSignal() {
+        let signal = "waiting";
+        let label = state.syncLabel;
+        if (state.connectionStatus !== "online") {
+            signal = "error";
+            label = state.connectionLabel || "未连接";
+        } else if (label === "已同步") {
+            signal = "synced";
+        } else if (
+            label.includes("失败") ||
+            label.includes("冲突") ||
+            label.includes("离线")
+        ) {
+            signal = "error";
+        }
+        syncState.dataset.state = signal;
+        syncState.setAttribute("aria-label", label);
         syncState.title = label;
+    }
+
+    function setSync(label) {
+        state.syncLabel = label;
+        renderSyncSignal();
     }
 
     function showToast(message, isError = false) {
         toast.textContent = message;
+        toast.setAttribute("aria-label", message);
         toast.className = isError ? "toast error" : "toast";
         toast.hidden = false;
         clearTimeout(showToast.timer);
         showToast.timer = setTimeout(() => {
             toast.hidden = true;
         }, 2800);
+    }
+
+    function showActionFeedback(
+        button,
+        message,
+        {
+            danger = false,
+            duration = 1600,
+            accessibleMessage = message,
+            symbol = false,
+        } = {},
+    ) {
+        const buttonRect = button.getBoundingClientRect();
+        const feedbackCenter = Math.min(
+            innerWidth - 58,
+            Math.max(58, buttonRect.left + buttonRect.width / 2),
+        );
+        toast.replaceChildren();
+        if (symbol) {
+            const icon = document.createElementNS(
+                "http://www.w3.org/2000/svg",
+                "svg",
+            );
+            icon.classList.add("action-feedback-icon");
+            icon.setAttribute("viewBox", "0 0 24 24");
+            icon.setAttribute("aria-hidden", "true");
+            const path = document.createElementNS(
+                "http://www.w3.org/2000/svg",
+                "path",
+            );
+            path.setAttribute(
+                "d",
+                "M18 6v3.5a5 5 0 0 1-5 5H5M9 10.5l-4 4 4 4",
+            );
+            icon.append(path);
+            toast.append(icon);
+        } else {
+            toast.textContent = message;
+        }
+        toast.setAttribute("aria-label", accessibleMessage);
+        toast.className = [
+            "toast",
+            "action-feedback",
+            danger ? "danger" : "",
+            symbol ? "symbol" : "",
+        ].filter(Boolean).join(" ");
+        toast.style.setProperty(
+            "--easytype-action-feedback-left",
+            `${Math.round(feedbackCenter)}px`,
+        );
+        toast.style.setProperty(
+            "--easytype-action-feedback-top",
+            `${Math.max(36, Math.round(buttonRect.top - 8))}px`,
+        );
+        toast.hidden = false;
+        clearTimeout(showToast.timer);
+        showToast.timer = setTimeout(() => {
+            toast.hidden = true;
+        }, duration);
     }
 
     function readDrafts() {
@@ -391,6 +488,108 @@
         keepEmptySharedInputEditable();
     }
 
+    function ensureSharedCaretVisible() {
+        if (document.activeElement !== input || input.disabled) {
+            return;
+        }
+        requestAnimationFrame(() => {
+            const cursor = input.selectionEnd ?? input.value.length;
+            if (cursor >= input.value.length - 1) {
+                input.scrollTop = Math.max(
+                    0,
+                    input.scrollHeight - input.clientHeight,
+                );
+            }
+        });
+    }
+
+    function updateVisualViewport() {
+        const viewport = globalThis.visualViewport;
+        const inputFocused = document.activeElement === input;
+        const toolbarHeight = Math.ceil(
+            editorToolbar.getBoundingClientRect().height,
+        );
+        const inputStyle = getComputedStyle(input);
+        const toolbarStyle = getComputedStyle(editorToolbar);
+        const fontSize = Number.parseFloat(inputStyle.fontSize) || 16;
+        const lineHeight = Number.parseFloat(inputStyle.lineHeight) || fontSize;
+        const textEdgeInset = Math.max(0, (lineHeight - fontSize) / 2);
+        const toolbarTopPadding =
+            Number.parseFloat(toolbarStyle.paddingTop) || 0;
+        const defaultBottomSpace = Math.max(
+            0,
+            Math.ceil(
+                toolbarHeight -
+                toolbarTopPadding -
+                textEdgeInset +
+                EDITOR_VISUAL_GAP_PX,
+            ),
+        );
+        editorCard.style.setProperty(
+            "--easytype-editor-toolbar-height",
+            `${toolbarHeight}px`,
+        );
+        editorCard.style.setProperty(
+            "--easytype-editor-bottom-space",
+            `${defaultBottomSpace}px`,
+        );
+        if (!viewport || !matchMedia("(max-width: 700px)").matches) {
+            document.body.classList.remove("keyboard-open");
+            return;
+        }
+        if (!inputFocused) {
+            visualViewportBaselineHeight = Math.max(
+                visualViewportBaselineHeight,
+                Math.round(viewport.height),
+            );
+        }
+        const layoutInset = Math.max(
+            0,
+            innerHeight - viewport.height - viewport.offsetTop,
+        );
+        const heightLoss = Math.max(
+            0,
+            visualViewportBaselineHeight - viewport.height,
+        );
+        const keyboardOpen =
+            inputFocused && Math.max(layoutInset, heightLoss) > 120;
+        document.body.classList.toggle("keyboard-open", keyboardOpen);
+        if (keyboardOpen) {
+            const cardRect = editorCard.getBoundingClientRect();
+            const preferredTop =
+                viewport.offsetTop + viewport.height - toolbarHeight - 8;
+            const cardMinimumTop = cardRect.top + 12;
+            const cardMaximumTop = cardRect.bottom - toolbarHeight - 12;
+            const toolbarTop = Math.max(
+                cardMinimumTop,
+                Math.min(preferredTop, cardMaximumTop),
+            );
+            const keyboardBottomSpace = Math.max(
+                defaultBottomSpace,
+                Math.ceil(
+                    cardRect.bottom -
+                    toolbarTop -
+                    toolbarTopPadding -
+                    textEdgeInset +
+                    EDITOR_VISUAL_GAP_PX,
+                ),
+            );
+            editorCard.style.setProperty(
+                "--easytype-editor-bottom-space",
+                `${keyboardBottomSpace}px`,
+            );
+            document.documentElement.style.setProperty(
+                "--easytype-floating-toolbar-top",
+                `${Math.round(toolbarTop)}px`,
+            );
+        } else {
+            document.documentElement.style.removeProperty(
+                "--easytype-floating-toolbar-top",
+            );
+        }
+        ensureSharedCaretVisible();
+    }
+
     function markdownLinePrefix(line) {
         let match = line.match(/^(\s*)([-+*])\s+\[([ xX])\]\s*(.*)$/);
         if (match) {
@@ -505,6 +704,7 @@
                 Math.min(selectionStart, input.value.length),
                 Math.min(selectionEnd, input.value.length),
             );
+            ensureSharedCaretVisible();
         }
         updateMeta();
         conflictPanel.hidden = !documentState.conflict;
@@ -841,6 +1041,9 @@
         if (leavingDirect) {
             stopDirect();
         }
+        if (mode === "direct" && state.editorImmersive) {
+            setEditorImmersive(false);
+        }
         state.workMode = mode;
         localStorage.setItem(WORK_MODE_KEY, mode);
         const boardMode = mode === "board";
@@ -850,6 +1053,7 @@
         directModeButton.setAttribute("aria-pressed", String(!boardMode));
         if (boardMode && state.activeBoardId) {
             renderActiveDocument();
+            requestAnimationFrame(updateVisualViewport);
         }
         renderDirectStatus();
     }
@@ -906,6 +1110,9 @@
                 "aria-label",
                 toggled ? "停止直输" : "开启直输",
             );
+        }
+        if (!socketReady()) {
+            directSurface.classList.add("is-error");
         }
         if (isLocal) {
             if (state.direct.serverStatus.active) {
@@ -1414,7 +1621,6 @@
         const generation = state.connectionGeneration + 1;
         state.connectionGeneration = generation;
         setConnection("connecting", "未连接");
-        connectionBadge.title = "正在建立实时连接";
         const scheme = location.protocol === "https:" ? "wss" : "ws";
         const socket = new WebSocket(`${scheme}://${location.host}/ws`);
         state.socket = socket;
@@ -1428,7 +1634,6 @@
                 return;
             }
             state.reconnectAttempt = 0;
-            connectionBadge.title = "实时连接正常";
             setConnection("online", "已连接");
             startHeartbeat(socket);
         });
@@ -1457,9 +1662,6 @@
             }
             stopHeartbeat();
             state.socket = null;
-            connectionBadge.title = event.reason
-                ? `连接已断开（${event.code}：${event.reason}）`
-                : `连接已断开（${event.code}）`;
             setConnection("offline", "未连接");
             resetDirectState();
             for (const [boardId, documentState] of state.documents) {
@@ -1533,12 +1735,73 @@
         });
         if (response.status === 401) {
             location.assign("/pair");
-            return;
+            return false;
         }
         const payload = await response.json();
         if (!response.ok) {
             throw new Error(payload.error?.message ?? "插入到电脑当前窗口失败。");
         }
+        return true;
+    }
+
+    function clearSharedBoard({ blur = true } = {}) {
+        if (!sharedTextValue()) {
+            return false;
+        }
+        if (blur) {
+            input.blur();
+        }
+        input.value = "";
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        if (!blur) {
+            ensureSharedCaretVisible();
+        }
+        return true;
+    }
+
+    function resetClearConfirmation() {
+        if (state.clearConfirmation?.timer) {
+            clearTimeout(state.clearConfirmation.timer);
+        }
+        state.clearConfirmation = null;
+    }
+
+    function requestClearSharedBoard() {
+        if (!sharedTextValue()) {
+            resetClearConfirmation();
+            return;
+        }
+        const now = Date.now();
+        const confirmation = state.clearConfirmation;
+        if (
+            confirmation?.boardId === state.activeBoardId &&
+            confirmation.expiresAt > now
+        ) {
+            resetClearConfirmation();
+            if (clearSharedBoard()) {
+                showActionFeedback(clearButton, "已清空");
+            }
+            return;
+        }
+
+        resetClearConfirmation();
+        const duration = 2600;
+        const boardId = state.activeBoardId;
+        const expiresAt = now + duration;
+        const timer = setTimeout(() => {
+            if (
+                state.clearConfirmation?.boardId === boardId &&
+                state.clearConfirmation.expiresAt === expiresAt
+            ) {
+                state.clearConfirmation = null;
+            }
+        }, duration);
+        state.clearConfirmation = { boardId, expiresAt, timer };
+        showActionFeedback(
+            clearButton,
+            "再次点击清空",
+            { danger: true, duration },
+        );
     }
 
     async function sendEnterToComputer() {
@@ -1549,12 +1812,13 @@
         });
         if (response.status === 401) {
             location.assign("/pair");
-            return;
+            return false;
         }
         const payload = await response.json();
         if (!response.ok) {
             throw new Error(payload.error?.message ?? "发送电脑回车失败。");
         }
+        return true;
     }
 
     function updateAccessModeUi(mode) {
@@ -1593,11 +1857,43 @@
         }
     }
 
+    function setEditorImmersive(open) {
+        const nextOpen = Boolean(open);
+        if (state.editorImmersive === nextOpen) {
+            return;
+        }
+        const inputWasFocused = document.activeElement === input;
+        state.editorImmersive = nextOpen;
+        editorCard.classList.toggle("is-immersive", nextOpen);
+        document.body.classList.toggle("editor-immersive", nextOpen);
+        expandEditorButton.setAttribute("aria-pressed", String(nextOpen));
+        expandEditorButton.setAttribute(
+            "aria-label",
+            nextOpen ? "退出全屏编辑" : "放大共享板",
+        );
+        if (nextOpen) {
+            if (!aboutPanel.hidden) {
+                setAboutOpen(false);
+            }
+            if (accessSettingsPanel && !accessSettingsPanel.hidden) {
+                setAccessSettingsOpen(false);
+            }
+        }
+        requestAnimationFrame(() => {
+            updateVisualViewport();
+            if (inputWasFocused) {
+                focusElement(input);
+                ensureSharedCaretVisible();
+            }
+        });
+    }
+
     input.addEventListener("input", () => {
         const documentState = activeDocument();
         if (!documentState) {
             return;
         }
+        resetClearConfirmation();
         documentState.localText = sharedTextValue();
         if (input.value !== documentState.localText && documentState.localText) {
             const cursor = Math.max(
@@ -1612,6 +1908,7 @@
             input.setSelectionRange(cursor, cursor);
         }
         keepEmptySharedInputEditable();
+        ensureSharedCaretVisible();
         updateMeta();
         notifyWhenLimitIsReached();
         saveDraft(
@@ -1648,10 +1945,36 @@
                 : "已关闭 Markdown 编辑辅助。",
         );
     });
+    if (clearAfterPasteToggle) {
+        clearAfterPasteToggle.checked = state.clearAfterPasteEnabled;
+        clearAfterPasteToggle.addEventListener("change", () => {
+            state.clearAfterPasteEnabled = clearAfterPasteToggle.checked;
+            localStorage.setItem(
+                CLEAR_AFTER_PASTE_KEY,
+                String(state.clearAfterPasteEnabled),
+            );
+            showToast(
+                state.clearAfterPasteEnabled
+                    ? "插入成功后将自动清空当前共享板。"
+                    : "已关闭插入后自动清空。",
+            );
+        });
+    }
     document.addEventListener("keydown", (event) => {
-        if (event.key === "Escape" && !aboutPanel.hidden) {
-            setAboutOpen(false);
+        if (event.key !== "Escape") {
+            return;
         }
+        if (!aboutPanel.hidden) {
+            setAboutOpen(false);
+        } else if (state.editorImmersive) {
+            setEditorImmersive(false);
+        }
+    });
+    expandEditorButton.addEventListener("pointerdown", (event) => {
+        event.preventDefault();
+    });
+    expandEditorButton.addEventListener("click", () => {
+        setEditorImmersive(!state.editorImmersive);
     });
     boardModeButton.addEventListener("click", () => requestWorkMode("board"));
     directModeButton.addEventListener("click", () => requestWorkMode("direct"));
@@ -1754,7 +2077,7 @@
         copyButton.addEventListener("click", async () => {
             try {
                 await copyToCurrentDevice();
-                showToast("已复制到当前设备剪贴板。");
+                showActionFeedback(copyButton, "已复制");
             } catch (error) {
                 showToast(error.message, true);
             }
@@ -1764,8 +2087,15 @@
     if (remoteEnterButton) {
         remoteEnterButton.addEventListener("click", async () => {
             try {
-                await sendEnterToComputer();
-                showToast("已发送电脑回车。");
+                const sent = await sendEnterToComputer();
+                if (!sent) {
+                    return;
+                }
+                showActionFeedback(
+                    remoteEnterButton,
+                    "↵",
+                    { accessibleMessage: "已发送回车", symbol: true },
+                );
             } catch (error) {
                 showToast(error.message, true);
             }
@@ -1775,21 +2105,39 @@
     if (pasteButton) {
         pasteButton.addEventListener("click", async () => {
             try {
-                await pasteIntoComputer();
-                showToast("已插入到电脑当前窗口。");
+                const inserted = await pasteIntoComputer();
+                if (!inserted) {
+                    return;
+                }
+                showActionFeedback(pasteButton, "已插入");
+                if (state.clearAfterPasteEnabled) {
+                    clearSharedBoard({ blur: false });
+                }
             } catch (error) {
                 showToast(error.message, true);
             }
         });
     }
 
-    clearButton.addEventListener("click", () => {
-        if (!sharedTextValue() || !confirm("确定清空当前共享板吗？")) {
-            return;
+    clearButton.addEventListener("click", requestClearSharedBoard);
+
+    for (const button of [pasteButton, remoteEnterButton]) {
+        button?.addEventListener("pointerdown", (event) => {
+            if (
+                document.activeElement === input &&
+                document.body.classList.contains("keyboard-open")
+            ) {
+                event.preventDefault();
+            }
+        });
+    }
+    clearButton.addEventListener("pointerdown", (event) => {
+        if (
+            document.activeElement === input &&
+            document.body.classList.contains("keyboard-open")
+        ) {
+            event.preventDefault();
         }
-        input.blur();
-        input.value = "";
-        input.dispatchEvent(new Event("input"));
     });
 
     if (directCapture) {
@@ -1858,6 +2206,7 @@
     input.addEventListener("compositionend", () => {
         state.sharedComposing = false;
         keepEmptySharedInputEditable();
+        ensureSharedCaretVisible();
     });
     input.addEventListener("keydown", (event) => {
         if (
@@ -1878,12 +2227,21 @@
                 state.markdownKeydownHandled = false;
             }, 0);
         }
+        setTimeout(ensureSharedCaretVisible, 0);
     });
-    input.addEventListener("focus", keepEmptySharedInputEditable);
+    input.addEventListener("focus", () => {
+        keepEmptySharedInputEditable();
+        visualViewportBaselineHeight = Math.max(
+            visualViewportBaselineHeight,
+            Math.round(globalThis.visualViewport?.height ?? innerHeight),
+        );
+        requestAnimationFrame(updateVisualViewport);
+    });
     input.addEventListener("blur", () => {
         if (input.value === EMPTY_INPUT_SENTINEL) {
             input.value = "";
         }
+        setTimeout(updateVisualViewport, 0);
     });
     editorCard.addEventListener("click", (event) => {
         if (event.target === editorCard) {
@@ -1938,6 +2296,26 @@
             return;
         }
         connect();
+    });
+
+    updateVisualViewport();
+    globalThis.visualViewport?.addEventListener(
+        "resize",
+        updateVisualViewport,
+    );
+    globalThis.visualViewport?.addEventListener(
+        "scroll",
+        updateVisualViewport,
+    );
+    window.addEventListener("resize", updateVisualViewport);
+    window.addEventListener("scroll", updateVisualViewport, { passive: true });
+    window.addEventListener("orientationchange", () => {
+        setTimeout(() => {
+            visualViewportBaselineHeight = Math.round(
+                globalThis.visualViewport?.height ?? innerHeight,
+            );
+            updateVisualViewport();
+        }, 250);
     });
 
     applyWorkMode(state.workMode);

@@ -97,7 +97,7 @@ def test_source_startup_command_uses_pythonw_and_current_options(
 
 
 def test_frozen_startup_command_uses_only_executable(monkeypatch, tmp_path):
-    executable = tmp_path / "EasyType-1.3.0.exe"
+    executable = tmp_path / "EasyType-1.4.0.exe"
     executable.touch()
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "executable", str(executable))
@@ -183,7 +183,7 @@ def test_tray_menu_controls_startup_and_opens_links(monkeypatch):
         "打开共享文本板",
         "- - - -",
         "开机自启动",
-        "EasyType v1.3.0",
+        "EasyType v1.4.0",
         "GitHub",
         "- - - -",
         "退出",

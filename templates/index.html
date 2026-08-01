@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="theme-color" content="#f7f8fb">
-    <title>EasyType 共享文本板</title>
+    <title>EasyType</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
 </head>
 <body>
@@ -16,12 +16,7 @@
         <header class="topbar">
             <div class="topbar-title-row">
                 <div>
-                    <p class="eyebrow">EASYTYPE</p>
                     <h1>EasyType</h1>
-                </div>
-                <div id="connectionBadge" class="status-badge status-connecting" aria-live="polite">
-                    <span class="status-dot"></span>
-                    <span id="connectionText">未连接</span>
                 </div>
             </div>
             <div class="topbar-actions">
@@ -88,10 +83,6 @@
                 <div class="about-item about-setting-item">
                     <div>
                         <strong>Markdown 编辑辅助</strong>
-                        <p>
-                            保持纯文本，不进行渲染；启用后，回车会自动延续列表、
-                            任务列表和引用标记。此开关只保存在当前浏览器。
-                        </p>
                     </div>
                     <label class="toggle-control" for="markdownAssistToggle">
                         <input
@@ -103,19 +94,26 @@
                         <span class="toggle-track" aria-hidden="true"></span>
                     </label>
                 </div>
-                <div class="about-item">
-                    <strong>手机端“插入”的作用</strong>
-                    <p>
-                        “插入”只显示在手机网页。点击后，运行 EasyType 的 Windows
-                        电脑会把共享文本粘贴到当前获得焦点的输入框中。
-                    </p>
+                {% if not is_local %}
+                <div class="about-item about-setting-item">
+                    <div>
+                        <strong>插入后自动清空</strong>
+                    </div>
+                    <label class="toggle-control" for="clearAfterPasteToggle">
+                        <input
+                            id="clearAfterPasteToggle"
+                            type="checkbox"
+                            role="switch"
+                            aria-label="插入后自动清空当前共享板"
+                        >
+                        <span class="toggle-track" aria-hidden="true"></span>
+                    </label>
                 </div>
+                {% endif %}
                 <div class="about-item">
                     <strong>直输模式</strong>
                     <p>
-                        手机语音或键盘输入会实时模拟到 Windows 当前窗口，
-                        不使用电脑剪贴板。未开启直输时，退格和回车也能
-                        直接操作电脑当前窗口。
+                        将手机输入实时发送到 Windows 当前窗口，不经过剪贴板。
                     </p>
                 </div>
                 <div class="about-item">
@@ -292,18 +290,38 @@
 
             <section class="editor-card">
                 <label class="sr-only" for="sharedText">共享文本</label>
+                <button
+                    id="expandEditorButton"
+                    class="editor-expand-button"
+                    type="button"
+                    aria-label="放大共享板"
+                    aria-pressed="false"
+                >
+                    <svg
+                        class="editor-corner-icon"
+                        viewBox="0 0 16 16"
+                        aria-hidden="true"
+                    >
+                        <path d="M3 3h1.5A8.5 8.5 0 0 1 13 11.5V13"></path>
+                    </svg>
+                </button>
                 <textarea
                     id="sharedText"
                     maxlength="{{ max_text_bytes }}"
-                    placeholder="在手机或电脑上输入，另一端会自动同步……"
                     spellcheck="false"
                     autocomplete="off"
                 ></textarea>
                 <footer class="editor-toolbar">
                     <div class="editor-meta">
                         <span id="charCount">0 字符</span>
-                        <span class="editor-meta-separator" aria-hidden="true">|</span>
-                        <span id="syncState" title="等待连接">等待连接</span>
+                        <span
+                            id="syncState"
+                            class="sync-light"
+                            data-state="error"
+                            role="status"
+                            aria-label="未连接"
+                            title="未连接"
+                        ></span>
                     </div>
                     <div class="editor-action-buttons{% if not is_local %} remote-actions{% endif %}">
                         {% if is_local %}

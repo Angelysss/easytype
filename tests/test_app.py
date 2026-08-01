@@ -74,7 +74,8 @@ def test_local_editor_and_info_are_available(client, monkeypatch):
     page_text = page.get_data(as_text=True)
 
     assert page.status_code == 200
-    assert "共享文本板" in page_text
+    assert "<title>EasyType</title>" in page_text
+    assert ">EASYTYPE<" not in page_text
     assert 'href="/admin"' in page_text
     assert "未连接" in page_text
     assert 'id="aboutButton"' in page_text
@@ -83,12 +84,9 @@ def test_local_editor_and_info_are_available(client, monkeypatch):
     assert "https://github.com/Angelysss/easytype" in page_text
     assert re.search(r'href="https://github.com/Angelysss/easytype"[^>]*>\s*GitHub\s*</a>', page_text)
     assert "项目地址" not in page_text
-    assert "手机端“插入”的作用" in page_text
-    assert re.search(
-        r'class="topbar-title-row"[^>]*>.*EasyType.*id="connectionBadge"',
-        page_text,
-        re.DOTALL,
-    )
+    assert "手机端“插入”的作用" not in page_text
+    assert 'id="connectionBadge"' not in page_text
+    assert 'id="connectionText"' not in page_text
     assert "正在连接服务" not in page_text
     assert "可信局域网模式" not in page_text
     assert "信任模式" in page_text
@@ -104,23 +102,28 @@ def test_local_editor_and_info_are_available(client, monkeypatch):
     assert 'id="directBackspaceButton"' not in page_text
     assert 'id="directEnterButton"' not in page_text
     assert 'id="markdownAssistToggle"' in page_text
+    assert 'id="clearAfterPasteToggle"' not in page_text
+    assert 'id="expandEditorButton"' in page_text
+    assert 'aria-label="放大共享板"' in page_text
+    assert 'placeholder="在手机或电脑上输入，另一端会自动同步……"' not in page_text
     assert 'role="switch"' in page_text
-    assert "保持纯文本，不进行渲染" in page_text
-    assert "EasyType v1.3.0" in page_text
+    assert "保持纯文本，不进行渲染" not in page_text
+    assert "EasyType v1.4.0" in page_text
     assert "http://192.168.1.10:5000" in page_text
     assert re.search(r'id="copyButton"[^>]*>\s*复制\s*</button>', page_text)
     assert 'id="remoteEnterButton"' not in page_text
     assert 'id="pasteButton"' not in page_text
     assert re.search(r'id="clearButton"[^>]*>\s*清空\s*</button>', page_text)
+    assert 'class="editor-meta-separator"' not in page_text
     assert re.search(
-        r'class="editor-meta"[^>]*>.*id="charCount".*>\|<.*id="syncState"',
+        r'class="editor-meta"[^>]*>.*id="charCount".*id="syncState"',
         page_text,
         re.DOTALL,
     )
     assert 'class="action-card"' not in page_text
     assert 'class="editor-action-note"' not in page_text
     assert info.status_code == 200
-    assert info.get_json()["version"] == "1.3.0"
+    assert info.get_json()["version"] == "1.4.0"
     assert info.get_json()["revision"] == 0
     assert info.get_json()["boardCount"] == 3
     assert info.get_json()["maxBoards"] == 8
@@ -158,15 +161,15 @@ def test_empty_shared_board_keeps_mobile_input_connection(client):
     editor_javascript = client.get("/static/editor.js").get_data(as_text=True)
 
     assert 'const EMPTY_INPUT_SENTINEL = "\\u200b"' in editor_javascript
-    assert 'input.addEventListener("focus", keepEmptySharedInputEditable)' in (
-        editor_javascript
-    )
+    assert 'input.addEventListener("focus", () =>' in editor_javascript
+    assert "keepEmptySharedInputEditable();" in editor_javascript
     assert "documentState.localText = sharedTextValue()" in editor_javascript
     assert "pendingBoardFocusId" not in editor_javascript
     assert "focusEditor" not in editor_javascript
     assert re.search(
-        r'input\.blur\(\);\s+input\.value = "";',
+        r'function clearSharedBoard.*input\.blur\(\);.*input\.value = "";',
         editor_javascript,
+        re.DOTALL,
     )
 
 
@@ -176,11 +179,193 @@ def test_markdown_assist_is_local_plain_text_editor_behavior(client):
     assert 'const MARKDOWN_ASSIST_KEY = "easytype.markdownAssist.v1"' in (
         editor_javascript
     )
+    assert "localStorage.getItem(MARKDOWN_ASSIST_KEY) !== \"false\"" in (
+        editor_javascript
+    )
     assert "localStorage.setItem(" in editor_javascript
     assert "function markdownLinePrefix(line)" in editor_javascript
     assert "function markdownLineBreakEdit()" in editor_javascript
     assert "input.setRangeText(edit.text" in editor_javascript
     assert '"insertLineBreak", "insertParagraph"' in editor_javascript
+
+
+def test_mobile_editor_keeps_actions_and_caret_visible(client):
+    editor_javascript = client.get("/static/editor.js").get_data(as_text=True)
+    stylesheet = client.get("/static/styles.css").get_data(as_text=True)
+
+    assert "function updateVisualViewport()" in editor_javascript
+    assert "globalThis.visualViewport?.addEventListener" in editor_javascript
+    assert '"--easytype-floating-toolbar-top"' in editor_javascript
+    assert "visualViewportBaselineHeight" in editor_javascript
+    assert "function ensureSharedCaretVisible()" in editor_javascript
+    assert "input.scrollHeight - input.clientHeight" in editor_javascript
+    assert "body.keyboard-open .editor-toolbar" in stylesheet
+    assert "position: absolute" in stylesheet
+    assert "border-top: 0" in stylesheet
+    assert "position: fixed" in stylesheet
+    assert 'top: var(--easytype-floating-toolbar-top, auto)' in stylesheet
+    assert "background: transparent" in stylesheet
+    assert "box-shadow: none" in stylesheet
+    assert "padding: 7px 7px 3px 2px" in stylesheet
+    assert "cardMaximumTop" in editor_javascript
+    assert 'window.addEventListener("scroll", updateVisualViewport' in (
+        editor_javascript
+    )
+    assert '"--easytype-editor-toolbar-height"' in editor_javascript
+    assert '"--easytype-editor-bottom-space"' in editor_javascript
+    assert "keyboardBottomSpace" in editor_javascript
+    assert "const EDITOR_VISUAL_GAP_PX = 8" in editor_javascript
+    assert "const textEdgeInset" in editor_javascript
+    assert "const toolbarTopPadding" in editor_javascript
+    assert "EDITOR_VISUAL_GAP_PX" in editor_javascript
+    assert "requestAnimationFrame(updateVisualViewport)" in editor_javascript
+    assert "margin-bottom: var(" in stylesheet
+    assert "--easytype-editor-bottom-space" in stylesheet
+
+
+def test_shared_board_can_enter_local_immersive_editor(client):
+    editor_javascript = client.get("/static/editor.js").get_data(as_text=True)
+    stylesheet = client.get("/static/styles.css").get_data(as_text=True)
+
+    assert "function setEditorImmersive(open)" in editor_javascript
+    assert 'editorCard.classList.toggle("is-immersive", nextOpen)' in (
+        editor_javascript
+    )
+    assert 'document.body.classList.toggle("editor-immersive", nextOpen)' in (
+        editor_javascript
+    )
+    assert 'nextOpen ? "退出全屏编辑" : "放大共享板"' in editor_javascript
+    assert 'expandEditorButton.addEventListener("pointerdown"' in (
+        editor_javascript
+    )
+    assert 'else if (state.editorImmersive)' in editor_javascript
+    assert ".editor-card.is-immersive" in stylesheet
+    assert "height: 100dvh" in stylesheet
+    assert ".editor-collapse-icon" not in stylesheet
+    assert ".editor-expand-icon" not in stylesheet
+    assert 'class="editor-corner-icon"' in client.get("/").get_data(
+        as_text=True
+    )
+    assert 'd="M3 3h1.5A8.5 8.5 0 0 1 13 11.5V13"' in client.get(
+        "/"
+    ).get_data(as_text=True)
+    assert "place-items: start end" in stylesheet
+    assert "--easytype-editor-inline-padding" in stylesheet
+    assert "--easytype-editor-inline-padding: 16px" in stylesheet
+    assert "padding-inline: var(--easytype-editor-inline-padding)" in stylesheet
+    assert "padding-block: 0" in stylesheet
+    assert "padding-bottom: clamp(18px, 3vw, 32px)" not in stylesheet
+    assert 'title="放大共享板"' not in client.get("/").get_data(as_text=True)
+
+
+def test_toolbar_actions_use_lightweight_anchored_feedback(client):
+    editor_javascript = client.get("/static/editor.js").get_data(as_text=True)
+    stylesheet = client.get("/static/styles.css").get_data(as_text=True)
+
+    assert "function showActionFeedback(" in editor_javascript
+    assert "danger = false" in editor_javascript
+    assert "duration = 1600" in editor_javascript
+    assert "accessibleMessage = message" in editor_javascript
+    assert 'remoteEnterButton,\n                    "↵"' in (
+        editor_javascript
+    )
+    assert '{ accessibleMessage: "已发送回车", symbol: true }' in (
+        editor_javascript
+    )
+    assert ".toast.action-feedback.symbol" in stylesheet
+    assert "align-items: center" in stylesheet
+    assert "justify-content: center" in stylesheet
+    assert ".action-feedback-icon" in stylesheet
+    assert "width: 26px" in stylesheet
+    assert ".toast.action-feedback[hidden]" in stylesheet
+    assert "toast.replaceChildren()" in editor_javascript
+    assert "document.createElementNS(" in editor_javascript
+    assert 'showActionFeedback(pasteButton, "已插入")' in editor_javascript
+    assert 'showActionFeedback(copyButton, "已复制")' in editor_javascript
+    assert ".toast.action-feedback" in stylesheet
+    assert "--easytype-action-feedback-left" in stylesheet
+    assert "background: rgba(239, 246, 255, 0.96)" in stylesheet
+
+
+def test_sync_status_uses_accessible_traffic_lights(client):
+    page_text = client.get("/").get_data(as_text=True)
+    editor_javascript = client.get("/static/editor.js").get_data(as_text=True)
+    stylesheet = client.get("/static/styles.css").get_data(as_text=True)
+
+    assert 'id="syncState"' in page_text
+    assert 'class="sync-light"' in page_text
+    assert 'data-state="error"' in page_text
+    assert 'role="status"' in page_text
+    assert 'syncState.dataset.state = signal' in editor_javascript
+    assert "function renderSyncSignal()" in editor_javascript
+    assert 'state.connectionStatus !== "online"' in editor_javascript
+    assert 'label = state.connectionLabel || "未连接"' in editor_javascript
+    assert 'label === "已同步"' in editor_javascript
+    assert 'label.includes("失败")' in editor_javascript
+    assert '.sync-light[data-state="synced"]' in stylesheet
+    assert '.sync-light[data-state="error"]' in stylesheet
+    assert "margin-top: 5px" in stylesheet
+    assert "renderDirectStatus();" in editor_javascript
+    assert re.search(
+        r'function renderDirectStatus\(\).*?if \(!socketReady\(\)\) \{.*?'
+        r'directSurface\.classList\.add\("is-error"\)',
+        editor_javascript,
+        re.DOTALL,
+    )
+    assert '.direct-surface.is-error .direct-wave' in stylesheet
+    assert 'directStatus.textContent = "未连接"' not in editor_javascript
+    assert 'directHint.textContent = "连接恢复后可继续使用直输"' not in (
+        editor_javascript
+    )
+
+
+def test_clear_action_requires_a_second_anchored_click(client):
+    editor_javascript = client.get("/static/editor.js").get_data(as_text=True)
+    stylesheet = client.get("/static/styles.css").get_data(as_text=True)
+
+    assert "function requestClearSharedBoard()" in editor_javascript
+    assert "function resetClearConfirmation()" in editor_javascript
+    assert '"再次点击清空"' in editor_javascript
+    assert 'showActionFeedback(clearButton, "已清空")' in editor_javascript
+    assert "confirmation.expiresAt > now" in editor_javascript
+    assert 'clearButton.addEventListener("click", requestClearSharedBoard)' in (
+        editor_javascript
+    )
+    assert 'confirm("确定清空当前共享板吗？")' not in editor_javascript
+    assert ".toast.action-feedback.danger" in stylesheet
+    assert "document.activeElement === input" in editor_javascript
+    assert 'document.body.classList.contains("keyboard-open")' in (
+        editor_javascript
+    )
+    assert re.search(
+        r'for \(const button of \[pasteButton, remoteEnterButton\]\).*?'
+        r'document\.activeElement === input.*?keyboard-open.*?event\.preventDefault',
+        editor_javascript,
+        re.DOTALL,
+    )
+    assert "[pasteButton, remoteEnterButton, clearButton]" not in (
+        editor_javascript
+    )
+
+
+def test_clear_after_paste_is_a_local_opt_in(client):
+    editor_javascript = client.get("/static/editor.js").get_data(as_text=True)
+
+    assert 'const CLEAR_AFTER_PASTE_KEY = "easytype.clearAfterPaste.v1"' in (
+        editor_javascript
+    )
+    assert "localStorage.getItem(CLEAR_AFTER_PASTE_KEY) !== \"false\"" in (
+        editor_javascript
+    )
+    assert "if (clearAfterPasteToggle)" in editor_javascript
+    assert "clearAfterPasteToggle.checked = state.clearAfterPasteEnabled" in (
+        editor_javascript
+    )
+    assert "const inserted = await pasteIntoComputer()" in editor_javascript
+    assert "if (state.clearAfterPasteEnabled)" in editor_javascript
+    assert "clearSharedBoard({ blur: false })" in (
+        editor_javascript
+    )
 
 
 def test_remote_device_must_pair_and_pairing_is_single_use(app, client):
@@ -275,6 +460,7 @@ def test_admin_is_loopback_only(app, client):
         remote_editor_text,
     )
     assert re.search(r'id="pasteButton"[^>]*>\s*插入\s*</button>', remote_editor_text)
+    assert 'id="clearAfterPasteToggle"' in remote_editor_text
     assert re.search(r'id="clearButton"[^>]*>\s*清空\s*</button>', remote_editor_text)
     assert (
         remote_editor_text.index('id="pasteButton"')
